@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.2.0)
-    Kurumsal Windows istemcileri için anlık saat izleme, müdahale, bakım ve otonom güncelleme ajanı.
+    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.3.0)
+    10-Saniyelik Zero-Cache GitHub OTA Güncelleme & Anlık Saat Kontrolü
 #>
 
 [CmdletBinding()]
@@ -19,7 +19,7 @@ param (
     [string]$GitHubRepo = "ayazOne/winops"
 )
 
-$AgentVersion = "1.2.0"
+$AgentVersion = "1.3.0"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 Write-Host "=============================================" -ForegroundColor Cyan
@@ -49,18 +49,34 @@ function Get-UptimeFormatted {
     }
 }
 
-# --- GitHub OTA Otonom Güncelleme ---
-function Invoke-AgentSelfUpdate {
+function Get-LatestGitHubCommitSha {
     try {
-        $versionUrl = "https://raw.githubusercontent.com/$GitHubRepo/main/version.json?t=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
-        $remoteMeta = Invoke-RestMethod -Uri $versionUrl -TimeoutSec 10 -ErrorAction Stop
+        $uri = "https://github.com/$GitHubRepo/info/refs?service=git-upload-pack&t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+        $resp = Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+        $text = if ($resp.Content -is [byte[]]) { [System.Text.Encoding]::ASCII.GetString($resp.Content) } else { [string]$resp.Content }
+        if ($text -match '([0-9a-f]{40})\s+refs/heads/main') {
+            return $Matches[1]
+        }
+    } catch {}
+    return "main"
+}
+
+# --- GitHub OTA Otonom Güncelleme (0sn Cache, 10sn Kontrol) ---
+function Invoke-AgentSelfUpdate {
+    param (
+        [string]$CommitSha = ""
+    )
+    try {
+        $ref = if ([string]::IsNullOrWhiteSpace($CommitSha)) { Get-LatestGitHubCommitSha } else { $CommitSha }
+        $versionUrl = "https://raw.githubusercontent.com/$GitHubRepo/$ref/version.json?t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+        $remoteMeta = Invoke-RestMethod -Uri $versionUrl -TimeoutSec 8 -ErrorAction Stop
 
         if ($remoteMeta.clientVersion -and ($remoteMeta.clientVersion -ne $AgentVersion)) {
             Write-Host "[OTA] Yeni sürüm algılandı: v$($remoteMeta.clientVersion) (Mevcut: v$AgentVersion). Otomatik indiriliyor..." -ForegroundColor Green
             
-            $remoteScriptUrl = "https://raw.githubusercontent.com/$GitHubRepo/main/client/ClientAgent.ps1?t=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+            $remoteScriptUrl = "https://raw.githubusercontent.com/$GitHubRepo/$ref/client/ClientAgent.ps1?t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
             $tempFile = "$env:TEMP\ClientAgent_new.ps1"
-            Invoke-RestMethod -Uri $remoteScriptUrl -OutFile $tempFile -TimeoutSec 15 -ErrorAction Stop
+            Invoke-RestMethod -Uri $remoteScriptUrl -OutFile $tempFile -TimeoutSec 12 -ErrorAction Stop
 
             $errors = $null
             [System.Management.Automation.PSParser]::Tokenize((Get-Content $tempFile -Raw), [ref]$errors) | Out-Null
@@ -101,7 +117,6 @@ function Invoke-MaintenanceAction {
         }
 
         "sync-ntp" {
-            Write-Host "[Saat] NTP Saat Senkronizasyonu başlatılıyor..." -ForegroundColor Cyan
             try {
                 $svc = Get-Service -Name w32time -ErrorAction SilentlyContinue
                 if ($svc.Status -ne 'Running') {
@@ -116,7 +131,6 @@ function Invoke-MaintenanceAction {
         }
 
         "sync-server-time" {
-            Write-Host "[Saat] Sunucu saati ile doğrudan eşitleniyor..." -ForegroundColor Cyan
             try {
                 $serverEpochMs = [int64]$Params["serverEpochMs"]
                 if ($serverEpochMs -gt 0) {
@@ -133,13 +147,11 @@ function Invoke-MaintenanceAction {
         }
 
         "set-custom-time" {
-            Write-Host "[Saat] Özel saat ayarlanıyor..." -ForegroundColor Cyan
             try {
                 $timeStr = $Params["timeString"]
                 $offsetMinutes = $Params["offsetMinutes"]
 
                 if (-not [string]::IsNullOrWhiteSpace($timeStr)) {
-                    # Sadece HH:mm:ss veya tam tarih-saat
                     $parsedDate = [DateTime]::Parse($timeStr)
                     Set-Date -Date $parsedDate -ErrorAction Stop | Out-Null
                     $output = "Saat manuel olarak ayarlandı: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
@@ -157,7 +169,6 @@ function Invoke-MaintenanceAction {
         }
 
         "clean-temp" {
-            Write-Host "[Bakım] Geçici dosya temizliği yapılıyor..." -ForegroundColor Cyan
             $cleanedCount = 0
             $tempPaths = @($env:TEMP, "C:\Windows\Temp")
             foreach ($path in $tempPaths) {
@@ -223,10 +234,11 @@ $cachedOsCaption = (Get-CimInstance Win32_OperatingSystem).Caption
 $cachedIp = Get-LocalIPv4
 $cachedTz = (Get-TimeZone).Id
 
-# --- Ana Döngü (3 Saniyede Bir Anlık Saat ve Görev Takibi) ---
+# --- Ana Döngü (3sn Saat Senkron & 10sn GitHub OTA) ---
 while ($true) {
     try {
-        if ((Get-Date).Subtract($lastUpdateCheck).TotalSeconds -ge 45) {
+        # Her 10 saniyede bir doğrudan GitHub OTA sürüm kontrolü (Zero-Cache)
+        if ((Get-Date).Subtract($lastUpdateCheck).TotalSeconds -ge 10) {
             $lastUpdateCheck = Get-Date
             $cachedIp = Get-LocalIPv4
             $null = Invoke-AgentSelfUpdate
@@ -251,8 +263,9 @@ while ($true) {
 
         $hbResp = Invoke-RestMethod -Uri "$ServerUrl/api/heartbeat" -Method POST -Body $heartbeatData -ContentType "application/json" -TimeoutSec 5 -ErrorAction Stop
 
+        # Sunucu yeni bir sürüm olduğunu bildirirse 1sn beklemeden anında güncelle!
         if ($hbResp.expectedClientVersion -and ($hbResp.expectedClientVersion -ne $AgentVersion)) {
-            $null = Invoke-AgentSelfUpdate
+            $null = Invoke-AgentSelfUpdate -CommitSha $hbResp.commitSha
         }
 
         # 2. Görev Sorgulama (Poll)
@@ -261,7 +274,6 @@ while ($true) {
 
         if ($pollResp.hasTask -and $pollResp.task) {
             $task = $pollResp.task
-            Write-Host "[GÖREV ALINDI] ID: $($task.id) | Eylem: $($task.action)" -ForegroundColor Green
             
             $paramHt = @{}
             if ($task.params) {
@@ -270,7 +282,6 @@ while ($true) {
 
             $taskResult = Invoke-MaintenanceAction -Action $task.action -Params $paramHt
 
-            # Görev sonrası güncel saati de hemen heartbeat ile bildir
             $nowAfter = Get-Date
             $postHb = @{
                 clientId   = $ClientId

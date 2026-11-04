@@ -1,5 +1,5 @@
 /**
- * Enterprise Windows Management Server - Real-Time Clock Sync & NOC Console (v1.2.0)
+ * Enterprise Windows Management Server - 10s Zero-Cache GitHub OTA & Clock Control (v1.3.0)
  * Port: 3000
  * Zero external dependencies (native http, https, fs, path, crypto)
  */
@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const SERVER_VERSION = '1.2.0';
+const SERVER_VERSION = '1.3.0';
 const PORT = process.env.PORT || 3000;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'ayazOne/winops';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -30,7 +30,12 @@ const ALLOWED_ACTIONS = [
   'update-agent'
 ];
 
-let remoteVersionCache = { serverVersion: SERVER_VERSION, clientVersion: '1.2.0', lastChecked: 0 };
+let remoteVersionCache = {
+  serverVersion: SERVER_VERSION,
+  clientVersion: '1.3.0',
+  commitSha: 'main',
+  lastChecked: '-'
+};
 let isUpdatingServer = false;
 
 function addLog(type, message) {
@@ -61,17 +66,38 @@ function sendTelegramNotification(message) {
       'Content-Length': Buffer.byteLength(payload)
     }
   });
-  req.on('error', (err) => console.error('[Telegram Error]:', err.message));
+  req.on('error', () => {});
   req.write(payload);
   req.end();
 }
 
-function performServerSelfUpdate(newVersion) {
+// GitHub CDN önbelleğini (5dk cache) tamamen aşmak için doğrudan Git protokolünden anlık Commit SHA alınır (0sn gecikme)
+function getLatestGitCommitSha() {
+  return new Promise((resolve) => {
+    const req = https.get(
+      `https://github.com/${GITHUB_REPO}/info/refs?service=git-upload-pack&t=${Date.now()}`,
+      { headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' } },
+      (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk.toString('utf8'); });
+        res.on('end', () => {
+          const match = data.match(/([0-9a-f]{40})\s+refs\/heads\/main/);
+          resolve(match ? match[1] : 'main');
+        });
+      }
+    );
+    req.on('error', () => resolve('main'));
+    req.setTimeout(8000, () => { req.destroy(); resolve('main'); });
+  });
+}
+
+function performServerSelfUpdate(newVersion, commitSha) {
   if (isUpdatingServer) return;
   isUpdatingServer = true;
-  addLog('system', `[OTA] Yeni sunucu sürümü algılandı (v${newVersion}). Otomatik indiriliyor...`);
+  const ref = commitSha || 'main';
+  addLog('system', `[OTA] Yeni sunucu sürümü bulundu (v${newVersion} @ ${ref.slice(0, 7)}). İndiriliyor...`);
 
-  const rawUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/server/server.js?t=${Date.now()}`;
+  const rawUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/${ref}/server/server.js?t=${Date.now()}`;
   https.get(rawUrl, (resp) => {
     let code = '';
     resp.on('data', c => { code += c; });
@@ -80,18 +106,18 @@ function performServerSelfUpdate(newVersion) {
         try {
           const serverPath = path.join(__dirname, 'server.js');
           fs.writeFileSync(serverPath, code, 'utf8');
-          addLog('system', `[OTA] Sunucu v${newVersion} sürümüne güncellendi. Yeniden başlatılıyor...`);
-          sendTelegramNotification(`🔄 *Sunucu Otomatik Güncellendi (v${SERVER_VERSION} -> v${newVersion})*\nYeniden başlatılıyor...`);
+          addLog('system', `[OTA] Sunucu v${newVersion} sürümüne güncellendi! 1 saniye içinde yeniden başlatılıyor...`);
+          sendTelegramNotification(`🔄 *Sunucu Otomatik Güncellendi (v${SERVER_VERSION} -> v${newVersion})*`);
           setTimeout(() => {
-            process.exit(0);
-          }, 1500);
+            process.exit(0); // start.bat döngüsü 1sn içinde yeni sürümü başlatır
+          }, 800);
         } catch (err) {
           isUpdatingServer = false;
           addLog('error', `[OTA Hatası] Dosya yazılamadı: ${err.message}`);
         }
       } else {
         isUpdatingServer = false;
-        addLog('error', `[OTA Hatası] GitHub'dan geçerli sunucu kodu alınamadı (HTTP ${resp.statusCode}).`);
+        addLog('error', `[OTA Hatası] Sunucu kodu indirilemedi (HTTP ${resp.statusCode}).`);
       }
     });
   }).on('error', err => {
@@ -100,31 +126,38 @@ function performServerSelfUpdate(newVersion) {
   });
 }
 
-function checkGitHubVersionAndAutoUpdate() {
-  const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/version.json?t=${Date.now()}`;
-  https.get(url, (res) => {
-    let data = '';
-    res.on('data', chunk => { data += chunk; });
-    res.on('end', () => {
-      try {
-        if (res.statusCode !== 200) return;
-        const parsed = JSON.parse(data);
-        remoteVersionCache = {
-          serverVersion: parsed.serverVersion || SERVER_VERSION,
-          clientVersion: parsed.clientVersion || '1.2.0',
-          lastChecked: new Date().toLocaleTimeString('tr-TR')
-        };
+async function checkGitHubVersionAndAutoUpdate() {
+  if (isUpdatingServer) return;
+  try {
+    const sha = await getLatestGitCommitSha();
+    const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${sha}/version.json?t=${Date.now()}`;
 
-        if (parsed.serverVersion && parsed.serverVersion !== SERVER_VERSION) {
-          performServerSelfUpdate(parsed.serverVersion);
-        }
-      } catch (e) {}
-    });
-  }).on('error', () => {});
+    https.get(url, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) return;
+          const parsed = JSON.parse(data);
+          remoteVersionCache = {
+            serverVersion: parsed.serverVersion || SERVER_VERSION,
+            clientVersion: parsed.clientVersion || '1.3.0',
+            commitSha: sha,
+            lastChecked: new Date().toLocaleTimeString('tr-TR')
+          };
+
+          if (parsed.serverVersion && parsed.serverVersion !== SERVER_VERSION) {
+            performServerSelfUpdate(parsed.serverVersion, sha);
+          }
+        } catch (e) {}
+      });
+    }).on('error', () => {});
+  } catch (e) {}
 }
 
-setTimeout(checkGitHubVersionAndAutoUpdate, 5000);
-setInterval(checkGitHubVersionAndAutoUpdate, 45 * 1000);
+// Her 10 saniyede bir anlık GitHub kontrolü (CDN önbelleksiz)
+setTimeout(checkGitHubVersionAndAutoUpdate, 2000);
+setInterval(checkGitHubVersionAndAutoUpdate, 10 * 1000);
 
 function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
@@ -205,7 +238,8 @@ const server = http.createServer(async (req, res) => {
         success: true,
         registered: true,
         serverEpochMs: Date.now(),
-        expectedClientVersion: remoteVersionCache.clientVersion
+        expectedClientVersion: remoteVersionCache.clientVersion,
+        commitSha: remoteVersionCache.commitSha
       });
     } catch (e) {
       return jsonResponse(res, 400, { error: e.message });
@@ -230,7 +264,6 @@ const server = http.createServer(async (req, res) => {
         pendingTask.status = 'in_progress';
       }
 
-      // Sunucu saatiyle eşitleme görevinde tam o anki milisaniyeyi gönder (gecikmesiz senkronizasyon)
       const taskCopy = JSON.parse(JSON.stringify(pendingTask));
       if (taskCopy.action === 'sync-server-time') {
         taskCopy.params = { ...taskCopy.params, serverEpochMs: Date.now() };
@@ -304,7 +337,6 @@ const server = http.createServer(async (req, res) => {
       const absDrift = Math.abs(c.driftSeconds || 0);
       if (isOnline && absDrift <= 3) syncedCount++;
 
-      // Canlı tahmini istemci saati (son heartbeat'ten bu yana geçen süreyi ekle)
       const estimatedClientMs = (c.epochMs || now) + (now - new Date(c.lastSeen).getTime());
 
       return {
@@ -414,8 +446,6 @@ function getDashboardHtml() {
       margin: 0 auto;
       width: 100%;
     }
-
-    /* Master Clock Hero Bar */
     .master-clock-bar {
       background: linear-gradient(135deg, #0f172a 0%, #172554 100%);
       border: 1px solid #1e3a8a;
@@ -429,11 +459,7 @@ function getDashboardHtml() {
       gap: 20px;
       box-shadow: 0 10px 30px rgba(0,0,0,0.4);
     }
-    .master-time-box {
-      display: flex;
-      align-items: center;
-      gap: 20px;
-    }
+    .master-time-box { display: flex; align-items: center; gap: 20px; }
     .master-clock-digits {
       font-family: 'JetBrains Mono', monospace;
       font-size: 38px;
@@ -442,155 +468,76 @@ function getDashboardHtml() {
       letter-spacing: 1px;
       text-shadow: 0 0 20px rgba(56, 189, 248, 0.4);
     }
-    .master-clock-meta {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
+    .master-clock-meta { display: flex; flex-direction: column; gap: 4px; }
     .master-clock-meta span.label {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      color: #93c5fd;
-      font-weight: 700;
+      font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+      color: #93c5fd; font-weight: 700;
     }
     .master-clock-meta span.date {
-      font-size: 14px;
-      color: #e2e8f0;
-      font-family: 'JetBrains Mono', monospace;
+      font-size: 14px; color: #e2e8f0; font-family: 'JetBrains Mono', monospace;
     }
-    .master-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      align-items: center;
-    }
+    .master-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
     .btn-hero {
-      padding: 10px 16px;
-      border-radius: 10px;
+      padding: 10px 16px; border-radius: 10px;
       border: 1px solid rgba(56, 189, 248, 0.35);
       background: rgba(56, 189, 248, 0.15);
-      color: #fff;
-      font-weight: 600;
-      font-size: 13px;
-      cursor: pointer;
-      transition: all 0.2s;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      width: auto;
-      margin: 0;
+      color: #fff; font-weight: 600; font-size: 13px;
+      cursor: pointer; transition: all 0.2s;
+      display: flex; align-items: center; gap: 8px;
+      width: auto; margin: 0;
     }
-    .btn-hero:hover {
-      background: var(--primary);
-      color: #070b12;
-      border-color: var(--primary);
-    }
-    .btn-hero.green {
-      background: rgba(16, 185, 129, 0.18);
-      border-color: rgba(16, 185, 129, 0.4);
-    }
-    .btn-hero.green:hover {
-      background: var(--success);
-      color: #070b12;
-    }
-
-    /* Stats Bar */
+    .btn-hero:hover { background: var(--primary); color: #070b12; border-color: var(--primary); }
+    .btn-hero.green { background: rgba(16, 185, 129, 0.18); border-color: rgba(16, 185, 129, 0.4); }
+    .btn-hero.green:hover { background: var(--success); color: #070b12; }
     .stats-bar {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 16px;
-      margin-bottom: 22px;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px; margin-bottom: 22px;
     }
     .stat-card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 14px 18px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 12px; padding: 14px 18px;
+      display: flex; align-items: center; justify-content: space-between;
     }
     .stat-info span { font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
     .stat-info h3 { font-size: 24px; font-weight: 700; margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
     .stat-badge { width: 42px; height: 42px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
-
-    /* Content Grid */
     .content-grid { display: grid; grid-template-columns: 2.3fr 1fr; gap: 22px; }
     @media (max-width: 1150px) { .content-grid { grid-template-columns: 1fr; } }
-
     .panel-box {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 14px; overflow: hidden;
+      display: flex; flex-direction: column;
     }
     .panel-header {
-      padding: 15px 20px;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
+      padding: 15px 20px; border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center;
     }
     .panel-header h2 { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-
     table { width: 100%; border-collapse: collapse; text-align: left; }
     th, td { padding: 14px 16px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: middle; }
     th { color: var(--text-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
     tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
-
-    /* Client Digital Clock Display */
-    .client-clock-wrap {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
+    .client-clock-wrap { display: flex; align-items: center; gap: 10px; }
     .client-digital-clock {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 20px;
-      font-weight: 700;
-      color: #fff;
-      background: #070b12;
-      padding: 6px 12px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      letter-spacing: 0.5px;
+      font-family: 'JetBrains Mono', monospace; font-size: 20px; font-weight: 700;
+      color: #fff; background: #070b12; padding: 6px 12px;
+      border-radius: 8px; border: 1px solid var(--border); letter-spacing: 0.5px;
     }
-    .drift-tag {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
-      padding: 3px 8px;
-      border-radius: 6px;
-      font-weight: 600;
-    }
+    .drift-tag { font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 3px 8px; border-radius: 6px; font-weight: 600; }
     .drift-ok { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
     .drift-warn { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
     .drift-bad { background: rgba(239, 68, 68, 0.18); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.35); }
-
     .pulse-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
     .pulse-online { background: var(--success); box-shadow: 0 0 8px var(--success); }
     .pulse-offline { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
-
     .quick-chip {
-      padding: 6px 10px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: #1b263b;
-      color: #e2e8f0;
-      font-size: 11.5px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.15s;
-      margin-left: 4px;
-      width: auto;
-      margin-bottom: 0;
+      padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border);
+      background: #1b263b; color: #e2e8f0; font-size: 11.5px; font-weight: 500;
+      cursor: pointer; transition: all 0.15s; margin-left: 4px; width: auto; margin-bottom: 0;
     }
     .quick-chip:hover { background: var(--primary); color: #070b12; border-color: var(--primary); font-weight: 600; }
     .quick-chip.sync-btn { background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.35); color: #34d399; }
     .quick-chip.sync-btn:hover { background: var(--success); color: #070b12; }
-
     select, input, button {
       width: 100%; padding: 10px 14px; border-radius: 8px;
       border: 1px solid var(--border); background: #070b12; color: #fff;
@@ -598,17 +545,10 @@ function getDashboardHtml() {
     }
     button.btn-primary { background: var(--primary); color: #070b12; font-weight: 700; cursor: pointer; border: none; }
     button.btn-primary:hover { opacity: 0.9; }
-
     .log-stream {
-      padding: 14px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11.5px;
-      max-height: 240px;
-      overflow-y: auto;
-      background: #070b12;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
+      padding: 14px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
+      max-height: 240px; overflow-y: auto; background: #070b12;
+      display: flex; flex-direction: column; gap: 6px;
     }
     .log-row { display: flex; gap: 10px; line-height: 1.5; }
     .log-time { color: var(--text-muted); }
@@ -619,8 +559,6 @@ function getDashboardHtml() {
       font-family: 'JetBrains Mono', monospace; font-size: 11px;
       max-height: 120px; overflow-y: auto; white-space: pre-wrap;
     }
-
-    /* Modal for Custom Clock Adjustment */
     .modal-backdrop {
       position: fixed; inset: 0; background: rgba(0,0,0,0.75);
       display: none; align-items: center; justify-content: center; z-index: 100;
@@ -642,17 +580,16 @@ function getDashboardHtml() {
       <div class="brand-logo">⏰</div>
       <div>
         <div class="brand-title">WinOps Merkezi Saat & Sistem Kontrol Konsolu</div>
-        <div class="brand-sub">Sunucu: <strong id="serverVer" style="color:var(--primary);">v1.2.0</strong> | GitHub: <a href="https://github.com/ayazOne/winops" target="_blank" style="color:var(--primary); text-decoration:none;">ayazOne/winops</a></div>
+        <div class="brand-sub">Sunucu: <strong id="serverVer" style="color:var(--primary);">v1.3.0</strong> | GitHub: <a href="https://github.com/ayazOne/winops" target="_blank" style="color:var(--primary); text-decoration:none;">ayazOne/winops</a></div>
       </div>
     </div>
     <div class="header-right">
-      <div class="ota-pill" id="otaStatusPill">🔄 Otonom Güncelleme: AKTİF</div>
+      <div class="ota-pill" id="otaStatusPill">⚡ 10sn Anlık GitHub OTA: AKTİF</div>
     </div>
   </header>
 
   <div class="main-layout">
 
-    <!-- Master Clock & Instant Broadcast Control Bar -->
     <div class="master-clock-bar">
       <div class="master-time-box">
         <div class="master-clock-digits" id="masterClock">00:00:00</div>
@@ -674,7 +611,6 @@ function getDashboardHtml() {
       </div>
     </div>
 
-    <!-- Stats Bar -->
     <div class="stats-bar">
       <div class="stat-card">
         <div class="stat-info"><span>Toplam İstemci</span><h3 id="statTotal">0</h3></div>
@@ -694,12 +630,11 @@ function getDashboardHtml() {
       </div>
     </div>
 
-    <!-- Main Grid -->
     <div class="content-grid">
       <div class="panel-box">
         <div class="panel-header">
           <h2>⏱️ İstemci Canlı Saatleri ve Anlık Müdahale</h2>
-          <span style="font-size:12px; color:var(--text-muted);" id="githubCheckInfo">Canlı Akış: 2sn</span>
+          <span style="font-size:12px; color:var(--text-muted);" id="githubCheckInfo">OTA Kontrolü: 10sn</span>
         </div>
         <table>
           <thead>
@@ -762,7 +697,6 @@ function getDashboardHtml() {
     </div>
   </div>
 
-  <!-- Custom Time Set Modal -->
   <div class="modal-backdrop" id="timeModal">
     <div class="modal-card">
       <h3 id="modalTitle">✏️ Saat Ayarla</h3>
@@ -791,7 +725,6 @@ function getDashboardHtml() {
     let lastFetchLocalMs = Date.now();
     let modalTargetClient = 'all';
 
-    // Saniyede 2 kez tüm saatleri akıcı şekilde güncelle
     function tickClocks() {
       const nowServer = new Date(Date.now() + serverOffsetMs);
       document.getElementById('masterClock').textContent = nowServer.toLocaleTimeString('tr-TR');
@@ -837,7 +770,8 @@ function getDashboardHtml() {
         document.getElementById('statOffline').textContent = data.stats.offline;
 
         if (data.remoteVersion && data.remoteVersion.lastChecked) {
-          document.getElementById('githubCheckInfo').textContent = 'Son OTA Kontrolü: ' + data.remoteVersion.lastChecked + ' | Canlı Akış: 2sn';
+          const shortSha = (data.remoteVersion.commitSha || '').slice(0, 7);
+          document.getElementById('githubCheckInfo').textContent = 'Son GitHub Kontrolü: ' + data.remoteVersion.lastChecked + ' (' + shortSha + ')';
         }
 
         const tbody = document.getElementById('clientsTable');
