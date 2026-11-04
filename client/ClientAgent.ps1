@@ -22,7 +22,7 @@ param (
     [string]$GitHubRepo = "ayazOne/winops"
 )
 
-$AgentVersion = "1.6.0"
+$AgentVersion = "1.7.0"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif (Test-Path "C:\WinOps\Client") { "C:\WinOps\Client" } else { "$env:LOCALAPPDATA\WinOps\Client" }
 $AuthFilePath = "$BaseDir\client-auth.json"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12

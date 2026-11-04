@@ -1,6 +1,6 @@
 /**
- * Enterprise Windows Management Server - shadcn/ui Edition (v1.6.0)
- * Strict Server-Side Sequential Counter (PC-01, PC-02, PC-03...) & Full List Reset
+ * Enterprise Windows Management Server - shadcn/ui Edition (v1.7.0)
+ * Slot Reservation (OFF/Reserved), Manual ID Support (PC-12), and CMD Generator
  * Port: 3001
  * Zero external dependencies (native http, https, fs, path, crypto)
  */
@@ -11,25 +11,23 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const SERVER_VERSION = '1.6.0';
+const SERVER_VERSION = '1.7.0';
 const PORT = process.env.PORT || 3001;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'ayazOne/winops';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
-// v1.6.0 ile birlikte sıfırdan temiz veritabanı dosyası
 const DB_FILE = path.join(__dirname, 'clients-registry-v16.json');
 
 // Storage
 const clients = new Map();
 const tasks = [];
 const eventLogs = [];
-const pendingRenames = new Map(); // token -> newId
+const pendingRenames = new Map();
 
-// Strict Server-Side Counter & Valid Token Registry
 let registry = {
   counter: 0,
-  tokens: {} // token -> clientId (e.g. "tok_abc123" -> "PC-01")
+  tokens: {} // token -> clientId
 };
 
 function loadRegistry() {
@@ -53,7 +51,19 @@ function saveRegistry() {
 
 loadRegistry();
 
-// Sunucu tarafından sırayla PC-01, PC-02, PC-03 üretir (Hostname aynı olsa bile her kurulum yeni sıra alır!)
+function formatClientId(input) {
+  if (!input) return null;
+  const str = String(input).trim().toUpperCase();
+  if (/^\d+$/.test(str)) {
+    return 'PC-' + str.padStart(2, '0');
+  }
+  if (/^PC-?\d+$/i.test(str)) {
+    const num = str.replace(/[^0-9]/g, '');
+    return 'PC-' + num.padStart(2, '0');
+  }
+  return str;
+}
+
 function allocateNextClientId() {
   registry.counter += 1;
   const assignedId = 'PC-' + String(registry.counter).padStart(2, '0');
@@ -79,7 +89,7 @@ const ALLOWED_ACTIONS = [
 
 let remoteVersionCache = {
   serverVersion: SERVER_VERSION,
-  clientVersion: '1.6.0',
+  clientVersion: '1.7.0',
   commitSha: 'main',
   lastChecked: '-'
 };
@@ -187,7 +197,7 @@ async function checkGitHubVersionAndAutoUpdate() {
           const parsed = JSON.parse(data);
           remoteVersionCache = {
             serverVersion: parsed.serverVersion || SERVER_VERSION,
-            clientVersion: parsed.clientVersion || '1.6.0',
+            clientVersion: parsed.clientVersion || '1.7.0',
             commitSha: sha,
             lastChecked: new Date().toLocaleTimeString('tr-TR')
           };
@@ -242,9 +252,43 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
 
-  // 0. Sunucu Tarafından Sıralı Numara Atama (Her çağrıda sıradaki PC-01, PC-02, PC-03... verilir)
+  // 0. Numara Atama (Sıralı VEYA İstenen Özel Numara örn: PC-12)
   if ((req.method === 'GET' || req.method === 'POST') && pathname === '/api/assign-id') {
     const hostname = url.searchParams.get('hostname') || 'Windows-PC';
+    const requestedRaw = url.searchParams.get('clientId');
+    const requestedId = (requestedRaw && requestedRaw !== 'AUTO') ? formatClientId(requestedRaw) : null;
+
+    if (requestedId) {
+      let token = null;
+      for (const [t, idVal] of Object.entries(registry.tokens)) {
+        if (idVal === requestedId) {
+          token = t;
+          break;
+        }
+      }
+      if (!token) {
+        token = crypto.randomBytes(8).toString('hex');
+        registry.tokens[token] = requestedId;
+        saveRegistry();
+      }
+
+      const match = requestedId.match(/^PC-(\d+)$/);
+      if (match) {
+        const num = parseInt(match[1], 10);
+        if (num > registry.counter) {
+          registry.counter = num;
+          saveRegistry();
+        }
+      }
+
+      addLog('system', `Özel numara atandı: ${requestedId} (${hostname})`);
+      return jsonResponse(res, 200, {
+        success: true,
+        clientId: requestedId,
+        token
+      });
+    }
+
     const allocated = allocateNextClientId();
     addLog('system', `Yeni sıra numarası verildi: ${allocated.clientId} (${hostname})`);
     return jsonResponse(res, 200, {
@@ -254,12 +298,92 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // 0.1 Admin API: Rename Client ID
+  // 0.1 Numara Rezerve Et / Listeye OFF Olarak Ekle (Örn: 12 -> PC-12 OFF)
+  if (req.method === 'POST' && pathname === '/api/clients/reserve') {
+    try {
+      const { id } = await parseJsonBody(req);
+      const formattedId = formatClientId(id);
+      if (!formattedId) {
+        return jsonResponse(res, 400, { error: 'Geçersiz numara.' });
+      }
+
+      let token = null;
+      for (const [t, idVal] of Object.entries(registry.tokens)) {
+        if (idVal === formattedId) {
+          token = t;
+          break;
+        }
+      }
+      if (!token) {
+        token = crypto.randomBytes(8).toString('hex');
+        registry.tokens[token] = formattedId;
+        saveRegistry();
+      }
+
+      const existing = clients.get(formattedId);
+      if (!existing || existing.isReserved) {
+        clients.set(formattedId, {
+          id: formattedId,
+          token,
+          hostname: 'Rezerve (OFF)',
+          ip: '-',
+          os: 'Windows',
+          uptime: '-',
+          version: '1.7.0',
+          systemTime: '--:--:--',
+          systemDate: 'Bekleniyor',
+          epochMs: Date.now(),
+          driftSeconds: 0,
+          timeZone: '-',
+          isReserved: true,
+          lastSeen: new Date(0).toISOString()
+        });
+      }
+
+      const match = formattedId.match(/^PC-(\d+)$/);
+      if (match) {
+        const num = parseInt(match[1], 10);
+        if (num >= registry.counter) {
+          registry.counter = num;
+          saveRegistry();
+        }
+      }
+
+      addLog('system', `[${formattedId}] rezerve edildi (OFF olarak eklendi).`);
+      return jsonResponse(res, 200, {
+        success: true,
+        clientId: formattedId,
+        cmdCommand: `powershell -ExecutionPolicy Bypass -NoProfile -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/${GITHUB_REPO}/main/install-client.ps1))) -ClientId '${formattedId}'"`
+      });
+    } catch (e) {
+      return jsonResponse(res, 400, { error: e.message });
+    }
+  }
+
+  // 0.2 Sıradaki Sayacı Manuel Ayarla (Örn: 12 yap)
+  if (req.method === 'POST' && pathname === '/api/set-counter') {
+    try {
+      const { nextNumber } = await parseJsonBody(req);
+      const num = parseInt(nextNumber, 10);
+      if (!isNaN(num) && num >= 1) {
+        registry.counter = num - 1;
+        saveRegistry();
+        const nextId = 'PC-' + String(num).padStart(2, '0');
+        addLog('system', `Sıradaki otomatik sayaç ${nextId} olarak ayarlandı.`);
+        return jsonResponse(res, 200, { success: true, nextNumber: nextId });
+      }
+      return jsonResponse(res, 400, { error: 'Geçersiz sayı.' });
+    } catch (e) {
+      return jsonResponse(res, 400, { error: e.message });
+    }
+  }
+
+  // 0.3 Admin API: Rename Client ID
   if (req.method === 'POST' && pathname === '/api/clients/rename') {
     try {
       const { oldId, newId } = await parseJsonBody(req);
-      const cleanOld = (oldId || '').trim();
-      const cleanNew = (newId || '').trim();
+      const cleanOld = formatClientId(oldId);
+      const cleanNew = formatClientId(newId);
       if (!cleanOld || !cleanNew) {
         return jsonResponse(res, 400, { error: 'Geçersiz isim.' });
       }
@@ -279,9 +403,8 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      // Token bazlı veya eski ID bazlı güncelleme işaretle
-      for (const [tok, cId] of Object.entries(registry.tokens)) {
-        if (cId === cleanOld) {
+      for (const [tok, idVal] of Object.entries(registry.tokens)) {
+        if (idVal === cleanOld) {
           registry.tokens[tok] = cleanNew;
         }
       }
@@ -295,7 +418,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 0.2 Admin API: Tekil İstemci Sil veya Tüm Listeyi Sıfırla
+  // 0.4 Admin API: Tekil Sil veya Tümünü Sıfırla
   if (req.method === 'POST' && pathname === '/api/clients/reset') {
     try {
       const { clientId } = await parseJsonBody(req);
@@ -311,12 +434,11 @@ const server = http.createServer(async (req, res) => {
         saveRegistry();
         addLog('system', `İstemci listeden silindi: [${clientId}]`);
       } else {
-        // Tüm listeyi ve sayacı sıfırla (PC-01'den yeniden başlar)
         clients.clear();
         tasks.length = 0;
         registry = { counter: 0, tokens: {} };
         saveRegistry();
-        addLog('system', `Tüm istemci listesi ve sıra sayacı sıfırlandı (PC-01'den başlayacak).`);
+        addLog('system', `Tüm liste ve sayaç sıfırlandı (PC-01'den başlayacak).`);
       }
       return jsonResponse(res, 200, { success: true });
     } catch (e) {
@@ -332,7 +454,6 @@ const server = http.createServer(async (req, res) => {
       const token = (data.token || '').trim();
       let clientId = (data.clientId || '').trim();
 
-      // Yalnızca geçerli bir kayıt token'ına sahip olan (sıfırlama sonrası eklenen) istemcileri kabul et!
       if (!token || !registry.tokens[token]) {
         return jsonResponse(res, 200, {
           success: false,
@@ -342,7 +463,6 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      // Sunucudaki güncel adını (token karşılığını) kullan
       const serverAssignedId = registry.tokens[token];
       let assignedClientId = null;
       if (serverAssignedId && serverAssignedId !== clientId) {
@@ -351,8 +471,8 @@ const server = http.createServer(async (req, res) => {
       }
 
       const existing = clients.get(clientId);
-      const isNew = !existing;
-      const versionChanged = existing && existing.version !== data.version;
+      const isNew = !existing || existing.isReserved;
+      const versionChanged = existing && !existing.isReserved && existing.version !== data.version;
 
       const clientEpochMs = data.epochMs ? Number(data.epochMs) : serverNowMs;
       const driftSeconds = Number(((clientEpochMs - serverNowMs) / 1000).toFixed(1));
@@ -364,19 +484,20 @@ const server = http.createServer(async (req, res) => {
         ip: data.ip || req.socket.remoteAddress,
         os: data.os || 'Windows',
         uptime: data.uptime || 'N/A',
-        version: data.version || '1.6.0',
+        version: data.version || '1.7.0',
         systemTime: data.systemTime || new Date(clientEpochMs).toLocaleTimeString('tr-TR'),
         systemDate: data.systemDate || new Date(clientEpochMs).toISOString().slice(0, 10),
         epochMs: clientEpochMs,
         driftSeconds,
         timeZone: data.timeZone || 'Local',
+        isReserved: false, // Artık gerçek makine bağlandı, rezerve durumundan çıktı!
         lastSeen: new Date().toISOString()
       };
       
       clients.set(clientId, clientInfo);
 
       if (isNew) {
-        addLog('join', `İstemci bağlandı: [${clientId}] (${clientInfo.hostname} - ${clientInfo.ip})`);
+        addLog('join', `İstemci aktif: [${clientId}] (${clientInfo.hostname} - ${clientInfo.ip})`);
         sendTelegramNotification(`🟢 *İstemci Bağlandı:*\nID: \`${clientId}\`\nHost: ${clientInfo.hostname}\nIP: ${clientInfo.ip}\nSaat: ${clientInfo.systemTime}`);
       } else if (versionChanged) {
         addLog('system', `İstemci [${clientId}] güncellendi: v${existing.version} -> v${clientInfo.version}`);
@@ -484,7 +605,7 @@ const server = http.createServer(async (req, res) => {
       .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }))
       .map(c => {
         const diffSeconds = Math.floor((now - new Date(c.lastSeen).getTime()) / 1000);
-        const isOnline = diffSeconds < 20;
+        const isOnline = !c.isReserved && diffSeconds < 20;
         if (isOnline) onlineCount++;
         const absDrift = Math.abs(c.driftSeconds || 0);
         if (isOnline && absDrift <= 3) syncedCount++;
@@ -682,11 +803,13 @@ function getDashboardHtml() {
       transition: border-color 0.15s;
     }
     .client-item:hover { border-color: #3f3f46; }
+    .client-item.is-reserved { border-style: dashed; background: #0c0c10; }
     .client-row-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
     .client-identity { display: flex; align-items: center; gap: 10px; }
     .status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
     .status-online { background: var(--emerald); box-shadow: 0 0 10px rgba(16, 185, 129, 0.6); }
     .status-offline { background: var(--rose); }
+    .status-reserved { background: var(--amber); box-shadow: 0 0 8px rgba(245, 158, 11, 0.4); }
     .client-name { font-size: 15px; font-weight: 600; color: var(--fg); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .client-meta { font-size: 12px; color: var(--muted-fg); font-family: 'JetBrains Mono', monospace; }
 
@@ -700,6 +823,7 @@ function getDashboardHtml() {
     .drift-ok { background: rgba(16, 185, 129, 0.12); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.25); }
     .drift-warn { background: rgba(245, 158, 11, 0.12); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.25); }
     .drift-bad { background: rgba(244, 63, 94, 0.15); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.3); }
+    .drift-reserved { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
 
     .client-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
@@ -738,7 +862,7 @@ function getDashboardHtml() {
     }
     .modal-dialog {
       background: var(--card); border: 1px solid var(--border);
-      border-radius: 12px; width: 100%; max-width: 420px; padding: 20px;
+      border-radius: 12px; width: 100%; max-width: 460px; padding: 22px;
       box-shadow: 0 20px 40px rgba(0,0,0,0.6);
     }
     .offset-btns { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 10px 0 16px; }
@@ -766,17 +890,16 @@ function getDashboardHtml() {
         <div class="brand-icon">W</div>
         <div class="brand-text">
           <h1>WinOps Console</h1>
-          <p>v<span id="serverVer">1.6.0</span> • <span id="githubCheckInfo">OTA Aktif</span></p>
+          <p>v<span id="serverVer">1.7.0</span> • <span id="githubCheckInfo">OTA Aktif</span></p>
         </div>
       </div>
       <div class="nav-status">
-        <span class="badge-outline">
-          <span>Sıradaki Kayıt: <strong id="nextNumBadge" style="color:var(--emerald);">PC-01</strong></span>
-        </span>
-        <span class="badge-outline">
-          <span class="dot-live"></span>
-          <span>10sn GitHub Sync</span>
-        </span>
+        <button class="btn btn-secondary btn-sm" onclick="openReserveModal()" title="İstediğiniz bir numarayı (örn: PC-12) rezerve edin veya CMD komutunu alın">
+          ➕ Numara Rezerve Et / CMD Al
+        </button>
+        <button class="btn btn-outline btn-sm" onclick="openCounterModal()" title="Sıradaki otomatik sayaç numarasını değiştirin">
+          Sıradaki: <strong id="nextNumBadge" style="color:var(--emerald); margin-left:4px;">PC-01</strong> ✏️
+        </button>
         <button class="btn btn-danger btn-sm" onclick="resetAllClients()">
           🗑️ Listeyi Sıfırla
         </button>
@@ -823,7 +946,7 @@ function getDashboardHtml() {
         <div class="kpi-val" id="statSynced">0</div>
       </div>
       <div class="sh-card kpi-card">
-        <div class="kpi-top"><span>Çevrimdışı</span><span style="color:var(--rose);">●</span></div>
+        <div class="kpi-top"><span>Çevrimdışı / Rezerve</span><span style="color:var(--rose);">●</span></div>
         <div class="kpi-val" id="statOffline" style="color:var(--rose);">0</div>
       </div>
     </section>
@@ -835,12 +958,13 @@ function getDashboardHtml() {
           <div class="sh-card-header">
             <div>
               <div class="sh-card-title">İstemci Cihazlar ve Canlı Saatler</div>
-              <div class="sh-card-desc">Her yeni kurulum sunucudan sırayla PC-01, PC-02, PC-03 numarası alır.</div>
+              <div class="sh-card-desc">Rezerve edilen veya çevrimdışı olan cihazları listede görebilir, tek tıkla CMD komutunu alabilirsiniz.</div>
             </div>
+            <button class="btn btn-secondary btn-sm" onclick="openReserveModal()">+ Rezerve Et</button>
           </div>
           <div class="client-list" id="clientsList">
             <div style="text-align:center; color:var(--muted-fg); padding:32px; font-size:13px;">
-              Liste temiz. İlk ekleyeceğiniz bilgisayar otomatik olarak <strong>PC-01</strong> adını alacak.
+              İstemci bağlantısı bekleniyor...
             </div>
           </div>
         </div>
@@ -951,7 +1075,7 @@ function getDashboardHtml() {
   <div class="modal-overlay" id="renameModal">
     <div class="modal-dialog">
       <h3 style="font-size:16px; font-weight:600; margin-bottom:4px;">İstemci Adını Düzenle</h3>
-      <p style="font-size:12px; color:var(--muted-fg); margin-bottom:16px;">Cihazın listedeki adını değiştirin (Örn: PC-02, MUHASEBE-01). İstemci otomatik güncellenir.</p>
+      <p style="font-size:12px; color:var(--muted-fg); margin-bottom:16px;">Cihazın listedeki adını değiştirin (Örn: PC-02, MUHASEBE-01).</p>
 
       <div class="form-group">
         <label class="form-label">Yeni İstemci Adı (ID)</label>
@@ -965,6 +1089,54 @@ function getDashboardHtml() {
     </div>
   </div>
 
+  <!-- Modal: Reserve Specific Number (Örn: 12 -> PC-12 OFF) -->
+  <div class="modal-overlay" id="reserveModal">
+    <div class="modal-dialog">
+      <h3 style="font-size:16px; font-weight:600; margin-bottom:4px;">➕ Numara Rezerve Et / CMD Komutu Al</h3>
+      <p style="font-size:12px; color:var(--muted-fg); margin-bottom:16px;">
+        Belirli bir sırayı boş/OFF olarak ekleyin veya o numarayı doğrudan dolduracak CMD komutunu kopyalayın.
+      </p>
+
+      <div class="form-group">
+        <label class="form-label">Rezerve Edilecek Numara</label>
+        <input type="text" class="sh-input" id="reserveNumberInput" placeholder="Örn: 12 veya PC-12" oninput="updateReservePreview()">
+      </div>
+
+      <div class="form-group" style="margin-top:6px;">
+        <label class="form-label">Bu Cihaz İçin CMD Komutu:</label>
+        <div class="terminal-box" id="reserveCmdPreview" style="font-size:11px; max-height:80px; user-select:all; cursor:pointer;" onclick="copyReserveCmd()" title="Tıklayıp Kopyala">
+          Komut oluşturuluyor...
+        </div>
+      </div>
+
+      <div style="display:flex; gap:8px; margin-top:16px;">
+        <button class="btn btn-outline" style="flex:1;" onclick="closeReserveModal()">Kapat</button>
+        <button class="btn btn-secondary" style="flex:1;" onclick="copyReserveCmd()">📋 Komutu Kopyala</button>
+        <button class="btn btn-primary" style="flex:1.2;" onclick="submitReserveClient()">➕ Listeye OFF Ekle</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Change Next Counter -->
+  <div class="modal-overlay" id="counterModal">
+    <div class="modal-dialog">
+      <h3 style="font-size:16px; font-weight:600; margin-bottom:4px;">✏️ Sıradaki Sayacı Ayarla</h3>
+      <p style="font-size:12px; color:var(--muted-fg); margin-bottom:16px;">
+        Otomatik sıra numarasını atlatmak için sıradaki verilecek numarayı girin (Örn: 13 girerseniz bir sonraki PC-13 olur).
+      </p>
+
+      <div class="form-group">
+        <label class="form-label">Sıradaki Numara</label>
+        <input type="number" class="sh-input" id="counterNumberInput" min="1" placeholder="Örn: 13">
+      </div>
+
+      <div style="display:flex; gap:8px;">
+        <button class="btn btn-outline" style="flex:1;" onclick="closeCounterModal()">Vazgeç</button>
+        <button class="btn btn-primary" style="flex:1;" onclick="submitSetCounter()">Kaydet</button>
+      </div>
+    </div>
+  </div>
+
   <div class="toast-wrap" id="toastWrap"></div>
 
   <script>
@@ -974,6 +1146,7 @@ function getDashboardHtml() {
     let lastFetchLocalMs = Date.now();
     let modalTargetClient = 'all';
     let renameOldId = '';
+    let currentGithubRepo = 'ayazOne/winops';
 
     function showToast(msg) {
       const wrap = document.getElementById('toastWrap');
@@ -981,7 +1154,21 @@ function getDashboardHtml() {
       el.className = 'toast';
       el.textContent = '✓ ' + msg;
       wrap.appendChild(el);
-      setTimeout(() => el.remove(), 3000);
+      setTimeout(() => el.remove(), 3500);
+    }
+
+    function copyToClipboard(text, successMsg) {
+      navigator.clipboard.writeText(text).then(() => {
+        showToast(successMsg || 'Panoya kopyalandı!');
+      }).catch(() => {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast(successMsg || 'Panoya kopyalandı!');
+      });
     }
 
     function tickClocks() {
@@ -995,8 +1182,12 @@ function getDashboardHtml() {
       latestClients.forEach(c => {
         const el = document.getElementById('clock-' + c.id);
         if (el) {
-          const clientLiveDate = new Date(c.estimatedClientMs + elapsedSinceFetch);
-          el.textContent = clientLiveDate.toLocaleTimeString('tr-TR');
+          if (c.isReserved) {
+            el.textContent = '--:--:--';
+          } else {
+            const clientLiveDate = new Date(c.estimatedClientMs + elapsedSinceFetch);
+            el.textContent = clientLiveDate.toLocaleTimeString('tr-TR');
+          }
         }
       });
     }
@@ -1019,6 +1210,7 @@ function getDashboardHtml() {
           serverOffsetMs = data.serverEpochMs - Date.now();
         }
         latestClients = data.clients || [];
+        if (data.githubRepo) currentGithubRepo = data.githubRepo;
 
         document.getElementById('serverVer').textContent = data.serverVersion;
         document.getElementById('statTotal').textContent = data.stats.total;
@@ -1040,7 +1232,7 @@ function getDashboardHtml() {
         targetSelect.innerHTML = '<option value="all">📢 Tüm İstemciler (Broadcast)</option>';
 
         if (latestClients.length === 0) {
-          listEl.innerHTML = '<div style="text-align:center; color:var(--muted-fg); padding:32px; font-size:13px;">Liste temiz. İlk ekleyeceğiniz bilgisayar otomatik olarak <strong>' + (data.nextNumber || 'PC-01') + '</strong> adını alacak.</div>';
+          listEl.innerHTML = '<div style="text-align:center; color:var(--muted-fg); padding:32px; font-size:13px;">Henüz cihaz yok. Yukarıdaki <strong>"Numara Rezerve Et"</strong> butonuyla boş slot açabilir veya cihaz kurulumu yapabilirsiniz.</div>';
         } else {
           listEl.innerHTML = latestClients.map(c => {
             targetSelect.innerHTML += \`<option value="\${c.id}">\${c.id} (\${c.hostname} - \${c.ip})</option>\`;
@@ -1049,7 +1241,10 @@ function getDashboardHtml() {
             const absDrift = Math.abs(drift);
             let driftClass = 'drift-ok';
             let driftLabel = 'Tam Senkron (' + (drift >= 0 ? '+' : '') + drift + 'sn)';
-            if (absDrift > 10) {
+            if (c.isReserved) {
+              driftClass = 'drift-reserved';
+              driftLabel = 'Rezerve (OFF)';
+            } else if (absDrift > 10) {
               driftClass = 'drift-bad';
               driftLabel = 'Saat Farklı (' + (drift >= 0 ? '+' : '') + drift + 'sn)';
             } else if (absDrift > 2) {
@@ -1057,13 +1252,14 @@ function getDashboardHtml() {
               driftLabel = 'Hafif Kayma (' + (drift >= 0 ? '+' : '') + drift + 'sn)';
             }
 
-            const initClockStr = new Date(c.estimatedClientMs).toLocaleTimeString('tr-TR');
+            const initClockStr = c.isReserved ? '--:--:--' : new Date(c.estimatedClientMs).toLocaleTimeString('tr-TR');
+            const cmdCode = getCmdForId(c.id);
 
             return \`
-              <div class="client-item">
+              <div class="client-item \${c.isReserved ? 'is-reserved' : ''}">
                 <div class="client-row-top">
                   <div class="client-identity">
-                    <span class="status-dot \${c.isOnline ? 'status-online' : 'status-offline'}"></span>
+                    <span class="status-dot \${c.isReserved ? 'status-reserved' : (c.isOnline ? 'status-online' : 'status-offline')}"></span>
                     <div>
                       <div class="client-name">
                         <span>\${c.id}</span>
@@ -1073,9 +1269,9 @@ function getDashboardHtml() {
                         <button class="btn btn-danger btn-xs" onclick="removeSingleClient('\${c.id}')" title="Listeden Sil">
                           ✕
                         </button>
-                        <span class="badge-outline" style="font-size:10px; padding:1px 7px;">v\${c.version || '1.0.0'}</span>
+                        <span class="badge-outline" style="font-size:10px; padding:1px 7px;">\${c.isReserved ? 'REZERVE' : 'v' + (c.version || '1.0.0')}</span>
                       </div>
-                      <div class="client-meta">\${c.hostname} • \${c.ip} • \${c.diffSeconds}sn önce</div>
+                      <div class="client-meta">\${c.hostname} • \${c.ip} • \${c.isReserved ? 'Bekleniyor' : c.diffSeconds + 'sn önce'}</div>
                     </div>
                   </div>
                   <span class="drift-pill \${driftClass}">\${driftLabel}</span>
@@ -1093,21 +1289,27 @@ function getDashboardHtml() {
                 </div>
 
                 <div class="client-actions">
-                  <button class="btn btn-emerald btn-sm" onclick="quickAction('\${c.id}', 'sync-server-time', {}, '\${c.id} sunucu saatine eşitleniyor')">
-                    ⚡ Saati Eşitle
+                  <button class="btn btn-secondary btn-sm" onclick="copyClientCmd('\${c.id}')" title="Bu makineye özel tek satırlık CMD kurulum komutunu kopyalar">
+                    📋 CMD Kopyala
                   </button>
-                  <button class="btn btn-secondary btn-sm" onclick="openTimeModal('\${c.id}')">
-                    ✏️ Saat Ayarla
-                  </button>
-                  <button class="btn btn-outline btn-sm" onclick="quickAction('\${c.id}', 'sync-ntp', {}, '\${c.id} NTP senkronizasyonu başlatıldı')">
-                    🌐 NTP Sync
-                  </button>
-                  <button class="btn btn-outline btn-sm" onclick="quickAction('\${c.id}', 'sys-info', {}, '\${c.id} sistem raporu istendi')">
-                    📊 Sistem Raporu
-                  </button>
-                  <button class="btn btn-outline btn-sm" onclick="quickAction('\${c.id}', 'flush-dns', {}, '\${c.id} DNS önbelleği temizleniyor')">
-                    🌐 DNS Temizle
-                  </button>
+                  \${!c.isReserved ? \`
+                    <button class="btn btn-emerald btn-sm" onclick="quickAction('\${c.id}', 'sync-server-time', {}, '\${c.id} sunucu saatine eşitleniyor')">
+                      ⚡ Saati Eşitle
+                    </button>
+                    <button class="btn btn-secondary btn-sm" onclick="openTimeModal('\${c.id}')">
+                      ✏️ Saat Ayarla
+                    </button>
+                    <button class="btn btn-outline btn-sm" onclick="quickAction('\${c.id}', 'sync-ntp', {}, '\${c.id} NTP senkronizasyonu başlatıldı')">
+                      🌐 NTP Sync
+                    </button>
+                    <button class="btn btn-outline btn-sm" onclick="quickAction('\${c.id}', 'sys-info', {}, '\${c.id} sistem raporu istendi')">
+                      📊 Sistem Raporu
+                    </button>
+                  \` : \`
+                    <span style="font-size:12px; color:var(--muted-fg); display:flex; align-items:center; margin-left:4px;">
+                      💡 Makinede CMD komutunu çalıştırdığınızda otomatik aktifleşip burayı doldurur.
+                    </span>
+                  \`}
                 </div>
               </div>
             \`;
@@ -1138,6 +1340,15 @@ function getDashboardHtml() {
           }).join('');
         }
       } catch (e) {}
+    }
+
+    function getCmdForId(id) {
+      return \`powershell -ExecutionPolicy Bypass -NoProfile -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/\${currentGithubRepo}/main/install-client.ps1))) -ClientId '\${id}'"\`;
+    }
+
+    function copyClientCmd(id) {
+      const cmd = getCmdForId(id);
+      copyToClipboard(cmd, id + ' için kurulum CMD komutu kopyalandı!');
     }
 
     async function quickAction(clientId, action, params = {}, toastMsg = '') {
@@ -1224,6 +1435,86 @@ function getDashboardHtml() {
       }
     }
 
+    // Reserve Modal Functions
+    function openReserveModal() {
+      const nextNum = document.getElementById('nextNumBadge').textContent || 'PC-01';
+      document.getElementById('reserveNumberInput').value = nextNum.replace('PC-', '');
+      updateReservePreview();
+      document.getElementById('reserveModal').style.display = 'flex';
+      setTimeout(() => document.getElementById('reserveNumberInput').focus(), 50);
+    }
+
+    function closeReserveModal() {
+      document.getElementById('reserveModal').style.display = 'none';
+    }
+
+    function getFormattedReserveInput() {
+      const raw = document.getElementById('reserveNumberInput').value.trim();
+      if (!raw) return 'PC-01';
+      if (/^\\d+$/.test(raw)) return 'PC-' + raw.padStart(2, '0');
+      if (/^PC-?\\d+$/i.test(raw)) return 'PC-' + raw.replace(/[^0-9]/g, '').padStart(2, '0');
+      return raw.toUpperCase();
+    }
+
+    function updateReservePreview() {
+      const targetId = getFormattedReserveInput();
+      const cmd = getCmdForId(targetId);
+      document.getElementById('reserveCmdPreview').textContent = cmd;
+    }
+
+    function copyReserveCmd() {
+      const targetId = getFormattedReserveInput();
+      const cmd = getCmdForId(targetId);
+      copyToClipboard(cmd, targetId + ' için kurulum CMD komutu kopyalandı!');
+    }
+
+    async function submitReserveClient() {
+      const targetId = getFormattedReserveInput();
+      const res = await fetch('/api/clients/reserve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: targetId })
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast(targetId + ' rezerve edildi ve listeye OFF olarak eklendi!');
+        closeReserveModal();
+        loadDashboard();
+      } else {
+        alert(data.error || 'Hata oluştu');
+      }
+    }
+
+    // Counter Modal
+    function openCounterModal() {
+      const current = document.getElementById('nextNumBadge').textContent || 'PC-01';
+      const numOnly = parseInt(current.replace(/[^0-9]/g, ''), 10) || 1;
+      document.getElementById('counterNumberInput').value = numOnly;
+      document.getElementById('counterModal').style.display = 'flex';
+      setTimeout(() => document.getElementById('counterNumberInput').focus(), 50);
+    }
+
+    function closeCounterModal() {
+      document.getElementById('counterModal').style.display = 'none';
+    }
+
+    async function submitSetCounter() {
+      const num = document.getElementById('counterNumberInput').value;
+      const res = await fetch('/api/set-counter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nextNumber: num })
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast('Sıradaki sayaç ' + data.nextNumber + ' olarak ayarlandı!');
+        closeCounterModal();
+        loadDashboard();
+      } else {
+        alert(data.error || 'Hata oluştu');
+      }
+    }
+
     async function applyCustomTimeString() {
       const timeString = document.getElementById('customTimeInput').value.trim();
       if (!timeString) return;
@@ -1245,7 +1536,7 @@ function getDashboardHtml() {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-  addLog('system', `WinOps v${SERVER_VERSION} başlatıldı (Liste sıfırlandı, sıradaki kayıt: PC-01) - Port: ${PORT}`);
+  addLog('system', `WinOps v${SERVER_VERSION} başlatıldı (Slot Rezerve & Özel Numara Desteği) - Port: ${PORT}`);
   console.log(`[WinOps Server v${SERVER_VERSION}] http://0.0.0.0:${PORT} adresinde çalışıyor`);
   sendTelegramNotification(`🚀 *WinOps Yönetim Sunucusu Başlatıldı (v${SERVER_VERSION})*\nPort: ${PORT}`);
 });

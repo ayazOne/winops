@@ -1,7 +1,7 @@
 {
-  "version": "1.6.0",
-  "serverVersion": "1.6.0",
-  "clientVersion": "1.6.0",
+  "version": "1.7.0",
+  "serverVersion": "1.7.0",
+  "clientVersion": "1.7.0",
   "repo": "ayazOne/winops",
-  "releaseNotes": "Sunucu merkezli kesin artan sayaç (PC-01, PC-02, PC-03...), tüm istemci listesi sıfırlama ve tekil silme eklendi (v1.6.0)."
+  "releaseNotes": "Numara Rezerve Etme (OFF Slot), Özel Numaralı CMD Üretici ve Sıradaki Sayacı Atlama/Ayarla Desteği (v1.7.0)."
 }

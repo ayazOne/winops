@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    WinOps İstemci Kurulum Otomasyonu (v1.6.0)
-    Her kurulumda doğrudan Sunucudan sıradaki numarayı (PC-01, PC-02, PC-03...) alır!
+    WinOps İstemci Kurulum Otomasyonu (v1.7.0)
+    Doğrudan Sunucudan Sıradaki Numarayı Alır VEYA Belirtilen Numarayı (Örn: PC-12) Doldurur!
 #>
 
 [CmdletBinding()]
@@ -10,10 +10,17 @@ param (
     [string]$ServerUrl = "http://51.195.176.183:3001",
 
     [Parameter(Mandatory = $false)]
+    [string]$ClientId = "AUTO",
+
+    [Parameter(Mandatory = $false)]
     [string]$GitHubRepo = "ayazOne/winops"
 )
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+if ($env:CLIENT_ID -and ($ClientId -eq "AUTO" -or -not $ClientId)) {
+    $ClientId = $env:CLIENT_ID
+}
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
@@ -22,7 +29,6 @@ try {
     if (-not (Test-Path $InstallDir)) {
         New-Item -ItemType Directory -Path $InstallDir -Force -ErrorAction Stop | Out-Null
     }
-    # Yazma testi
     Set-Content -Path "$InstallDir\.write_test" -Value "ok" -Force -ErrorAction Stop
     Remove-Item "$InstallDir\.write_test" -Force -ErrorAction SilentlyContinue
 } catch {
@@ -41,9 +47,11 @@ Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'cmd.ex
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-# Doğrudan Sunucudan Sıradaki Numarayı Al (PC-01, PC-02, PC-03...)
+# Sunucudan Sıradaki Numarayı veya İstenen Numarayı (Örn: PC-12) Al
 $escapedHost = [uri]::EscapeDataString($env:COMPUTERNAME)
-$assignResp = Invoke-RestMethod -Uri "$ServerUrl/api/assign-id?hostname=$escapedHost&t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())" -Method GET -TimeoutSec 10 -ErrorAction Stop
+$escapedClient = [uri]::EscapeDataString($ClientId)
+$assignUri = "$ServerUrl/api/assign-id?hostname=$escapedHost&clientId=$escapedClient&t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+$assignResp = Invoke-RestMethod -Uri $assignUri -Method GET -TimeoutSec 10 -ErrorAction Stop
 
 $ClientId = $assignResp.clientId
 $Token = $assignResp.token
@@ -109,5 +117,5 @@ if ($isAdmin) {
 
 Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$InstallDir\run.cmd`"" -WindowStyle Hidden
 
-Write-Host "[3/3] Başarıyla Eklendi! Sunucu Sıra Numarası: $ClientId" -ForegroundColor Green
+Write-Host "[3/3] Başarıyla Eklendi! Atanan İstemci: $ClientId" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan
