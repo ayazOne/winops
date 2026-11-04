@@ -1,6 +1,6 @@
 /**
- * Enterprise Windows Management Server - 10s Zero-Cache GitHub OTA & Clock Control (v1.3.0)
- * Port: 3000
+ * Enterprise Windows Management Server - shadcn/ui Edition (v1.4.0)
+ * Port: 3001
  * Zero external dependencies (native http, https, fs, path, crypto)
  */
 
@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const SERVER_VERSION = '1.3.1';
+const SERVER_VERSION = '1.4.0';
 const PORT = process.env.PORT || 3001;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'ayazOne/winops';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -25,6 +25,10 @@ const ALLOWED_ACTIONS = [
   'sync-server-time',
   'set-custom-time',
   'clean-temp',
+  'flush-dns',
+  'net-info',
+  'process-list',
+  'gpupdate',
   'restart-service',
   'sys-info',
   'update-agent'
@@ -32,7 +36,7 @@ const ALLOWED_ACTIONS = [
 
 let remoteVersionCache = {
   serverVersion: SERVER_VERSION,
-  clientVersion: '1.3.0',
+  clientVersion: '1.4.0',
   commitSha: 'main',
   lastChecked: '-'
 };
@@ -71,7 +75,6 @@ function sendTelegramNotification(message) {
   req.end();
 }
 
-// GitHub CDN önbelleğini (5dk cache) tamamen aşmak için doğrudan Git protokolünden anlık Commit SHA alınır (0sn gecikme)
 function getLatestGitCommitSha() {
   return new Promise((resolve) => {
     const req = https.get(
@@ -106,10 +109,10 @@ function performServerSelfUpdate(newVersion, commitSha) {
         try {
           const serverPath = path.join(__dirname, 'server.js');
           fs.writeFileSync(serverPath, code, 'utf8');
-          addLog('system', `[OTA] Sunucu v${newVersion} sürümüne güncellendi! 1 saniye içinde yeniden başlatılıyor...`);
+          addLog('system', `[OTA] Sunucu v${newVersion} sürümüne güncellendi! Yeniden başlatılıyor...`);
           sendTelegramNotification(`🔄 *Sunucu Otomatik Güncellendi (v${SERVER_VERSION} -> v${newVersion})*`);
           setTimeout(() => {
-            process.exit(0); // start.bat döngüsü 1sn içinde yeni sürümü başlatır
+            process.exit(0);
           }, 800);
         } catch (err) {
           isUpdatingServer = false;
@@ -141,7 +144,7 @@ async function checkGitHubVersionAndAutoUpdate() {
           const parsed = JSON.parse(data);
           remoteVersionCache = {
             serverVersion: parsed.serverVersion || SERVER_VERSION,
-            clientVersion: parsed.clientVersion || '1.3.0',
+            clientVersion: parsed.clientVersion || '1.4.0',
             commitSha: sha,
             lastChecked: new Date().toLocaleTimeString('tr-TR')
           };
@@ -155,7 +158,6 @@ async function checkGitHubVersionAndAutoUpdate() {
   } catch (e) {}
 }
 
-// Her 10 saniyede bir anlık GitHub kontrolü (CDN önbelleksiz)
 setTimeout(checkGitHubVersionAndAutoUpdate, 2000);
 setInterval(checkGitHubVersionAndAutoUpdate, 10 * 1000);
 
@@ -197,7 +199,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
 
-  // 1. Client Heartbeat + Real-Time Clock Tracking
+  // 1. Client Heartbeat
   if (req.method === 'POST' && pathname === '/api/heartbeat') {
     try {
       const data = await parseJsonBody(req);
@@ -231,7 +233,7 @@ const server = http.createServer(async (req, res) => {
         addLog('join', `Yeni istemci bağlandı: [${clientId}] (${clientInfo.ip}) - Saat: ${clientInfo.systemTime}`);
         sendTelegramNotification(`🟢 *Yeni İstemci Bağlandı:*\nID: \`${clientId}\`\nHost: ${clientInfo.hostname}\nIP: ${clientInfo.ip}\nSaat: ${clientInfo.systemTime}\nVersiyon: v${clientInfo.version}`);
       } else if (versionChanged) {
-        addLog('system', `İstemci [${clientId}] yeni sürüme güncellendi: v${existing.version} -> v${clientInfo.version}`);
+        addLog('system', `İstemci [${clientId}] güncellendi: v${existing.version} -> v${clientInfo.version}`);
       }
 
       return jsonResponse(res, 200, {
@@ -287,7 +289,7 @@ const server = http.createServer(async (req, res) => {
         if (!task.results) task.results = {};
         task.results[clientId] = output;
 
-        addLog('task_done', `Görev tamamlandı: [${clientId}] -> ${task.action}: ${(output || '').replace(/\n/g, ' ')}`);
+        addLog('task_done', `Görev tamamlandı: [${clientId}] -> ${task.action}`);
         sendTelegramNotification(`⚡ *Görev Tamamlandı (${task.action}):*\nİstemci: \`${clientId}\`\nDurum: *${status}*\nÇıktı:\n\`\`\`\n${(output || '').slice(0, 500)}\n\`\`\``);
       }
       return jsonResponse(res, 200, { success: true });
@@ -311,13 +313,14 @@ const server = http.createServer(async (req, res) => {
         params: params || {},
         status: 'pending',
         results: {},
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        timeLabel: new Date().toLocaleTimeString('tr-TR')
       };
 
       tasks.unshift(newTask);
       if (tasks.length > 100) tasks.pop();
 
-      addLog('dispatch', `Komut gönderildi: [${action}] -> Hedef: [${newTask.targetClientId}]`);
+      addLog('dispatch', `Komut kuyruğa eklendi: [${action}] -> Hedef: [${newTask.targetClientId}]`);
       return jsonResponse(res, 200, { success: true, task: newTask });
     } catch (e) {
       return jsonResponse(res, 400, { error: e.message });
@@ -378,345 +381,686 @@ const server = http.createServer(async (req, res) => {
 
 function getDashboardHtml() {
   return `<!DOCTYPE html>
-<html lang="tr">
+<html lang="tr" class="dark">
 <head>
   <meta charset="UTF-8">
-  <title>WinOps - Merkezi Saat & Sistem Kontrol Konsolu</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <title>WinOps — Saat & Sistem Yönetimi</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
+    /* shadcn/ui Zinc Dark Theme Tokens */
     :root {
-      --bg: #070b12;
-      --panel: #0f172a;
-      --card: #1e293b;
-      --border: #26354d;
-      --primary: #38bdf8;
-      --primary-glow: rgba(56, 189, 248, 0.25);
-      --success: #10b981;
-      --danger: #ef4444;
-      --warning: #f59e0b;
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
+      --bg: #09090b;
+      --card: #0c0c0f;
+      --card-hover: #121216;
+      --muted: #18181b;
+      --muted-fg: #a1a1aa;
+      --border: #27272a;
+      --input: #27272a;
+      --fg: #fafafa;
+      --primary: #fafafa;
+      --primary-fg: #09090b;
+      --secondary: #27272a;
+      --secondary-fg: #fafafa;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --rose: #f43f5e;
+      --radius: 0.75rem;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
     body {
-      font-family: 'Plus Jakarta Sans', sans-serif;
-      background: var(--bg);
-      color: var(--text);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: var(--bg);
+      color: var(--fg);
       min-height: 100vh;
-      display: flex;
-      flex-direction: column;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
     }
-    header {
-      background: var(--panel);
-      border-bottom: 1px solid var(--border);
-      padding: 14px 28px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
+
+    /* Top Navbar */
+    .navbar {
       position: sticky;
       top: 0;
-      z-index: 50;
+      z-index: 40;
+      backdrop-filter: blur(12px);
+      background: rgba(9, 9, 11, 0.85);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 20px;
     }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .brand-logo {
-      width: 38px; height: 38px;
-      background: linear-gradient(135deg, #0284c7, #38bdf8);
-      border-radius: 10px;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 20px;
-      box-shadow: 0 0 15px var(--primary-glow);
-    }
-    .brand-title { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
-    .brand-sub { font-size: 11px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
-    .header-right { display: flex; align-items: center; gap: 12px; }
-    .ota-pill {
-      font-size: 11px;
-      font-family: 'JetBrains Mono', monospace;
-      padding: 6px 12px;
-      border-radius: 8px;
-      background: rgba(16, 185, 129, 0.1);
-      color: var(--success);
-      border: 1px solid rgba(16, 185, 129, 0.25);
-    }
-    .main-layout {
-      flex: 1;
-      padding: 22px 28px;
-      max-width: 1650px;
+    .navbar-inner {
+      max-width: 1440px;
       margin: 0 auto;
-      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
     }
-    .master-clock-bar {
-      background: linear-gradient(135deg, #0f172a 0%, #172554 100%);
-      border: 1px solid #1e3a8a;
-      border-radius: 16px;
-      padding: 20px 26px;
-      margin-bottom: 22px;
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .brand-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      background: var(--fg);
+      color: var(--bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .brand-text h1 {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    .brand-text p {
+      font-size: 11px;
+      color: var(--muted-fg);
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .nav-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .badge-outline {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 500;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      border: 1px solid var(--border);
+      background: var(--muted);
+      color: var(--fg);
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .dot-live {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--emerald);
+      box-shadow: 0 0 8px var(--emerald);
+    }
+
+    /* Container */
+    .container {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* shadcn Card */
+    .sh-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .sh-card-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .sh-card-title {
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .sh-card-desc {
+      font-size: 12px;
+      color: var(--muted-fg);
+    }
+    .sh-card-body {
+      padding: 20px;
+    }
+
+    /* Hero Server Clock Banner */
+    .hero-banner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 16px;
+      padding: 20px 24px;
+      background: linear-gradient(180deg, #121215 0%, #09090b 100%);
+    }
+    .hero-clock-group {
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .hero-clock {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 36px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: var(--fg);
+      line-height: 1;
+    }
+    .hero-date {
+      font-size: 13px;
+      color: var(--muted-fg);
+    }
+    .hero-btn-group {
       display: flex;
       flex-wrap: wrap;
-      justify-content: space-between;
+      gap: 8px;
+    }
+
+    /* shadcn Buttons */
+    .btn {
+      display: inline-flex;
       align-items: center;
-      gap: 20px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+      justify-content: center;
+      gap: 6px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 500;
+      height: 36px;
+      padding: 0 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      border: 1px solid transparent;
+      white-space: nowrap;
+      text-decoration: none;
     }
-    .master-time-box { display: flex; align-items: center; gap: 20px; }
-    .master-clock-digits {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 38px;
+    .btn:active { transform: scale(0.98); }
+    .btn-primary {
+      background: var(--primary);
+      color: var(--primary-fg);
+    }
+    .btn-primary:hover { opacity: 0.9; }
+    .btn-secondary {
+      background: var(--secondary);
+      color: var(--secondary-fg);
+      border-color: #3f3f46;
+    }
+    .btn-secondary:hover { background: #3f3f46; }
+    .btn-outline {
+      background: transparent;
+      color: var(--fg);
+      border-color: var(--border);
+    }
+    .btn-outline:hover { background: var(--muted); }
+    .btn-emerald {
+      background: rgba(16, 185, 129, 0.12);
+      color: #34d399;
+      border-color: rgba(16, 185, 129, 0.3);
+    }
+    .btn-emerald:hover {
+      background: var(--emerald);
+      color: #09090b;
+    }
+    .btn-sm {
+      height: 32px;
+      padding: 0 10px;
+      font-size: 12px;
+      border-radius: 6px;
+    }
+
+    /* KPI Metrics Grid */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+    .kpi-card {
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .kpi-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--muted-fg);
+      font-weight: 500;
+    }
+    .kpi-val {
+      font-size: 26px;
       font-weight: 700;
-      color: var(--primary);
-      letter-spacing: 1px;
-      text-shadow: 0 0 20px rgba(56, 189, 248, 0.4);
+      font-family: 'JetBrains Mono', monospace;
+      letter-spacing: -0.02em;
     }
-    .master-clock-meta { display: flex; flex-direction: column; gap: 4px; }
-    .master-clock-meta span.label {
-      font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
-      color: #93c5fd; font-weight: 700;
+
+    /* Main Workspace Grid */
+    .workspace-grid {
+      display: grid;
+      grid-template-columns: 1.85fr 1fr;
+      gap: 20px;
+      align-items: start;
     }
-    .master-clock-meta span.date {
-      font-size: 14px; color: #e2e8f0; font-family: 'JetBrains Mono', monospace;
+
+    /* Client Cards List (Mobile & Desktop Friendly) */
+    .client-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 16px;
     }
-    .master-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-    .btn-hero {
-      padding: 10px 16px; border-radius: 10px;
-      border: 1px solid rgba(56, 189, 248, 0.35);
-      background: rgba(56, 189, 248, 0.15);
-      color: #fff; font-weight: 600; font-size: 13px;
-      cursor: pointer; transition: all 0.2s;
-      display: flex; align-items: center; gap: 8px;
-      width: auto; margin: 0;
+    .client-item {
+      border: 1px solid var(--border);
+      background: #0f0f13;
+      border-radius: 10px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      transition: border-color 0.15s;
     }
-    .btn-hero:hover { background: var(--primary); color: #070b12; border-color: var(--primary); }
-    .btn-hero.green { background: rgba(16, 185, 129, 0.18); border-color: rgba(16, 185, 129, 0.4); }
-    .btn-hero.green:hover { background: var(--success); color: #070b12; }
-    .stats-bar {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 16px; margin-bottom: 22px;
+    .client-item:hover {
+      border-color: #3f3f46;
     }
-    .stat-card {
-      background: var(--panel); border: 1px solid var(--border);
-      border-radius: 12px; padding: 14px 18px;
-      display: flex; align-items: center; justify-content: space-between;
+    .client-row-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
     }
-    .stat-info span { font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
-    .stat-info h3 { font-size: 24px; font-weight: 700; margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
-    .stat-badge { width: 42px; height: 42px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
-    .content-grid { display: grid; grid-template-columns: 2.3fr 1fr; gap: 22px; }
-    @media (max-width: 1150px) { .content-grid { grid-template-columns: 1fr; } }
-    .panel-box {
-      background: var(--panel); border: 1px solid var(--border);
-      border-radius: 14px; overflow: hidden;
-      display: flex; flex-direction: column;
+    .client-identity {
+      display: flex;
+      align-items: center;
+      gap: 10px;
     }
-    .panel-header {
-      padding: 15px 20px; border-bottom: 1px solid var(--border);
-      display: flex; justify-content: space-between; align-items: center;
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
     }
-    .panel-header h2 { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-    table { width: 100%; border-collapse: collapse; text-align: left; }
-    th, td { padding: 14px 16px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: middle; }
-    th { color: var(--text-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-    tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
-    .client-clock-wrap { display: flex; align-items: center; gap: 10px; }
-    .client-digital-clock {
-      font-family: 'JetBrains Mono', monospace; font-size: 20px; font-weight: 700;
-      color: #fff; background: #070b12; padding: 6px 12px;
-      border-radius: 8px; border: 1px solid var(--border); letter-spacing: 0.5px;
+    .status-online { background: var(--emerald); box-shadow: 0 0 10px rgba(16, 185, 129, 0.6); }
+    .status-offline { background: var(--rose); }
+    .client-name {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--fg);
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
-    .drift-tag { font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 3px 8px; border-radius: 6px; font-weight: 600; }
-    .drift-ok { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
-    .drift-warn { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
-    .drift-bad { background: rgba(239, 68, 68, 0.18); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.35); }
-    .pulse-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-    .pulse-online { background: var(--success); box-shadow: 0 0 8px var(--success); }
-    .pulse-offline { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
-    .quick-chip {
-      padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border);
-      background: #1b263b; color: #e2e8f0; font-size: 11.5px; font-weight: 500;
-      cursor: pointer; transition: all 0.15s; margin-left: 4px; width: auto; margin-bottom: 0;
+    .client-meta {
+      font-size: 12px;
+      color: var(--muted-fg);
+      font-family: 'JetBrains Mono', monospace;
     }
-    .quick-chip:hover { background: var(--primary); color: #070b12; border-color: var(--primary); font-weight: 600; }
-    .quick-chip.sync-btn { background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.35); color: #34d399; }
-    .quick-chip.sync-btn:hover { background: var(--success); color: #070b12; }
-    select, input, button {
-      width: 100%; padding: 10px 14px; border-radius: 8px;
-      border: 1px solid var(--border); background: #070b12; color: #fff;
-      margin-bottom: 12px; font-size: 13px; font-family: inherit;
+
+    /* Client Clock Box */
+    .client-clock-panel {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 16px;
     }
-    button.btn-primary { background: var(--primary); color: #070b12; font-weight: 700; cursor: pointer; border: none; }
-    button.btn-primary:hover { opacity: 0.9; }
-    .log-stream {
-      padding: 14px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
-      max-height: 240px; overflow-y: auto; background: #070b12;
-      display: flex; flex-direction: column; gap: 6px;
+    .client-digital {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--fg);
+      letter-spacing: -0.02em;
     }
-    .log-row { display: flex; gap: 10px; line-height: 1.5; }
-    .log-time { color: var(--text-muted); }
-    .log-msg { color: #cbd5e1; }
-    pre.code-out {
-      background: #070b12; padding: 10px 12px; border-radius: 6px;
-      border: 1px solid var(--border); color: #38bdf8;
-      font-family: 'JetBrains Mono', monospace; font-size: 11px;
-      max-height: 120px; overflow-y: auto; white-space: pre-wrap;
+    .drift-pill {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 9999px;
     }
-    .modal-backdrop {
-      position: fixed; inset: 0; background: rgba(0,0,0,0.75);
-      display: none; align-items: center; justify-content: center; z-index: 100;
+    .drift-ok { background: rgba(16, 185, 129, 0.12); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.25); }
+    .drift-warn { background: rgba(245, 158, 11, 0.12); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.25); }
+    .drift-bad { background: rgba(244, 63, 94, 0.15); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.3); }
+
+    /* Client Action Toolbar */
+    .client-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
     }
-    .modal-card {
-      background: var(--panel); border: 1px solid var(--border);
-      border-radius: 14px; width: 420px; max-width: 92%; padding: 22px;
-      box-shadow: 0 20px 50px rgba(0,0,0,0.6);
+
+    /* Form Elements (shadcn Input & Select) */
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 14px;
     }
-    .modal-card h3 { font-size: 16px; margin-bottom: 6px; }
-    .modal-card p { font-size: 12px; color: var(--text-muted); margin-bottom: 16px; }
-    .offset-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+    .form-label {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--fg);
+    }
+    .sh-select, .sh-input {
+      width: 100%;
+      height: 38px;
+      padding: 0 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--fg);
+      font-family: inherit;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .sh-select:focus, .sh-input:focus {
+      border-color: #71717a;
+    }
+
+    /* Preset Command Grid */
+    .cmd-preset-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    /* Terminal Output & Logs */
+    .terminal-box {
+      background: #050507;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11.5px;
+      color: #d4d4d8;
+      max-height: 220px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+
+    /* Toast Notification */
+    .toast-wrap {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      z-index: 100;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+    }
+    .toast {
+      background: var(--fg);
+      color: var(--bg);
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+      animation: slideIn 0.2s ease;
+    }
+    @keyframes slideIn {
+      from { transform: translateY(12px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+
+    /* Modal Dialog */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.8);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 90;
+      padding: 16px;
+    }
+    .modal-dialog {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      width: 100%;
+      max-width: 420px;
+      padding: 20px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+    }
+    .offset-btns {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      margin: 10px 0 16px;
+    }
+
+    /* Mobile Responsive Breakpoints */
+    @media (max-width: 1024px) {
+      .workspace-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px) {
+      .container { padding: 12px; gap: 14px; }
+      .kpi-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+      .hero-banner { padding: 16px; }
+      .hero-clock { font-size: 28px; }
+      .hero-btn-group { width: 100%; }
+      .hero-btn-group .btn { flex: 1; justify-content: center; font-size: 12px; padding: 0 10px; }
+      .client-actions .btn-sm { flex: 1 1 calc(50% - 8px); justify-content: center; height: 36px; }
+      .cmd-preset-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
 
-  <header>
-    <div class="brand">
-      <div class="brand-logo">⏰</div>
+  <!-- Top Navbar -->
+  <nav class="navbar">
+    <div class="navbar-inner">
+      <div class="brand">
+        <div class="brand-icon">W</div>
+        <div class="brand-text">
+          <h1>WinOps Console</h1>
+          <p>v<span id="serverVer">1.4.0</span> • <span id="githubCheckInfo">OTA Aktif</span></p>
+        </div>
+      </div>
+      <div class="nav-status">
+        <span class="badge-outline">
+          <span class="dot-live"></span>
+          <span>10sn GitHub Sync</span>
+        </span>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Main Content -->
+  <main class="container">
+
+    <!-- Server Reference Clock & Quick Broadcast -->
+    <section class="sh-card hero-banner">
       <div>
-        <div class="brand-title">WinOps Merkezi Saat & Sistem Kontrol Konsolu</div>
-        <div class="brand-sub">Sunucu: <strong id="serverVer" style="color:var(--primary);">v1.3.0</strong> | GitHub: <a href="https://github.com/ayazOne/winops" target="_blank" style="color:var(--primary); text-decoration:none;">ayazOne/winops</a></div>
-      </div>
-    </div>
-    <div class="header-right">
-      <div class="ota-pill" id="otaStatusPill">⚡ 10sn Anlık GitHub OTA: AKTİF</div>
-    </div>
-  </header>
-
-  <div class="main-layout">
-
-    <div class="master-clock-bar">
-      <div class="master-time-box">
-        <div class="master-clock-digits" id="masterClock">00:00:00</div>
-        <div class="master-clock-meta">
-          <span class="label">🖥️ Sunucu Referans Saati</span>
-          <span class="date" id="masterDate">----/--/--</span>
+        <div style="font-size:11px; color:var(--muted-fg); text-transform:uppercase; font-weight:600; letter-spacing:0.05em; margin-bottom:4px;">
+          Sunucu Referans Saati
+        </div>
+        <div class="hero-clock-group">
+          <div class="hero-clock" id="masterClock">00:00:00</div>
+          <div class="hero-date" id="masterDate">Yükleniyor...</div>
         </div>
       </div>
-      <div class="master-actions">
-        <button class="btn-hero green" onclick="quickAction('all', 'sync-server-time')">
-          ⚡ Tüm İstemcileri Sunucu Saatine Eşitle
+      <div class="hero-btn-group">
+        <button class="btn btn-primary" onclick="quickAction('all', 'sync-server-time', {}, 'Tüm istemciler sunucu saatine eşitleniyor')">
+          ⚡ Tümünü Sunucu Saatine Eşitle
         </button>
-        <button class="btn-hero" onclick="quickAction('all', 'sync-ntp')">
-          🌐 Tümünü NTP (İnternet Saati) ile Eşitle
+        <button class="btn btn-secondary" onclick="quickAction('all', 'sync-ntp', {}, 'Tüm istemcilere NTP komutu gönderildi')">
+          🌐 Tümünü NTP ile Eşitle
         </button>
-        <button class="btn-hero" onclick="openTimeModal('all')">
-          ✏️ Toplu Manuel Saat Ayarla
+        <button class="btn btn-outline" onclick="openTimeModal('all')">
+          ✏️ Toplu Saat Ayarla
         </button>
       </div>
-    </div>
+    </section>
 
-    <div class="stats-bar">
-      <div class="stat-card">
-        <div class="stat-info"><span>Toplam İstemci</span><h3 id="statTotal">0</h3></div>
-        <div class="stat-badge" style="background:rgba(56, 189, 248, 0.1); color:var(--primary);">💻</div>
+    <!-- KPI Cards -->
+    <section class="kpi-grid">
+      <div class="sh-card kpi-card">
+        <div class="kpi-top"><span>Toplam Cihaz</span><span>💻</span></div>
+        <div class="kpi-val" id="statTotal">0</div>
       </div>
-      <div class="stat-card">
-        <div class="stat-info"><span>Çevrimiçi (Online)</span><h3 id="statOnline" style="color:var(--success);">0</h3></div>
-        <div class="stat-badge" style="background:rgba(16, 185, 129, 0.1); color:var(--success);">🟢</div>
+      <div class="sh-card kpi-card">
+        <div class="kpi-top"><span>Çevrimiçi</span><span style="color:var(--emerald);">●</span></div>
+        <div class="kpi-val" id="statOnline" style="color:var(--emerald);">0</div>
       </div>
-      <div class="stat-card">
-        <div class="stat-info"><span>Saati Tam Senkron</span><h3 id="statSynced" style="color:var(--primary);">0</h3></div>
-        <div class="stat-badge" style="background:rgba(56, 189, 248, 0.1); color:var(--primary);">⏱️</div>
+      <div class="sh-card kpi-card">
+        <div class="kpi-top"><span>Saati Senkron</span><span>⏱️</span></div>
+        <div class="kpi-val" id="statSynced">0</div>
       </div>
-      <div class="stat-card">
-        <div class="stat-info"><span>Çevrimdışı (Offline)</span><h3 id="statOffline" style="color:var(--danger);">0</h3></div>
-        <div class="stat-badge" style="background:rgba(239, 68, 68, 0.1); color:var(--danger);">💤</div>
+      <div class="sh-card kpi-card">
+        <div class="kpi-top"><span>Çevrimdışı</span><span style="color:var(--rose);">●</span></div>
+        <div class="kpi-val" id="statOffline" style="color:var(--rose);">0</div>
       </div>
-    </div>
+    </section>
 
-    <div class="content-grid">
-      <div class="panel-box">
-        <div class="panel-header">
-          <h2>⏱️ İstemci Canlı Saatleri ve Anlık Müdahale</h2>
-          <span style="font-size:12px; color:var(--text-muted);" id="githubCheckInfo">OTA Kontrolü: 10sn</span>
+    <!-- Workspace Grid -->
+    <div class="workspace-grid">
+
+      <!-- Left Column: Connected Clients & Live Clocks -->
+      <div style="display:flex; flex-direction:column; gap:20px;">
+        <div class="sh-card">
+          <div class="sh-card-header">
+            <div>
+              <div class="sh-card-title">İstemci Cihazlar ve Canlı Saatler</div>
+              <div class="sh-card-desc">Her istemcinin saati 3 saniyede bir gerçek zamanlı senkronize edilir.</div>
+            </div>
+          </div>
+          <div class="client-list" id="clientsList">
+            <div style="text-align:center; color:var(--muted-fg); padding:32px; font-size:13px;">
+              İstemci bağlantısı bekleniyor...
+            </div>
+          </div>
         </div>
-        <table>
-          <thead>
-            <tr>
-              <th>Durum & Cihaz</th>
-              <th>İstemci Canlı Saati</th>
-              <th>Saat Farkı (Sapma)</th>
-              <th>Ajan</th>
-              <th style="text-align:right;">Anlık Saat & Bakım Kontrolü</th>
-            </tr>
-          </thead>
-          <tbody id="clientsTable">
-            <tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:30px;">İstemciler taranıyor...</td></tr>
-          </tbody>
-        </table>
 
-        <div class="panel-header" style="border-top:1px solid var(--border); margin-top:auto;">
-          <h2>📡 Canlı Operasyon Akışı (Live NOC Log)</h2>
-        </div>
-        <div class="log-stream" id="logStream">
-          <div class="log-row"><span class="log-time">[--:--:--]</span><span class="log-msg">Sistem izleniyor...</span></div>
+        <!-- Live Logs Card -->
+        <div class="sh-card">
+          <div class="sh-card-header">
+            <div class="sh-card-title">Canlı Sistem Akışı (Event Log)</div>
+          </div>
+          <div class="sh-card-body" style="padding:14px;">
+            <div class="terminal-box" id="logStream">Henüz kayıt yok.</div>
+          </div>
         </div>
       </div>
 
-      <div style="display:flex; flex-direction:column; gap:22px;">
-        <div class="panel-box">
-          <div class="panel-header"><h2>🛠️ Gelişmiş Bakım & Komut Gönderici</h2></div>
-          <div style="padding:18px;">
-            <label style="font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">Hedef İstemci</label>
-            <select id="targetClient">
-              <option value="all">📢 Tüm İstemciler (Broadcast)</option>
-            </select>
+      <!-- Right Column: System & CMD Tools + Task Outputs -->
+      <div style="display:flex; flex-direction:column; gap:20px;">
 
-            <label style="font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">İşlem Seçin</label>
-            <select id="actionSelect">
-              <option value="sync-server-time">⚡ Sunucu Saatine Anında Eşitle</option>
-              <option value="sync-ntp">🌐 NTP Saat Senkronizasyonu</option>
-              <option value="clean-temp">🧹 Önbellek & Temp Temizliği</option>
-              <option value="sys-info">📊 Donanım & Sistem Raporu</option>
-              <option value="restart-service">🔄 Windows Servisi Yeniden Başlat</option>
-              <option value="update-agent">🚀 Ajanı Şimdi Güncelle (OTA)</option>
-            </select>
-
-            <div id="serviceParamDiv" style="display:none;">
-              <label style="font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">Servis Adı</label>
-              <input type="text" id="serviceName" placeholder="Örn: Spooler, w32time" value="w32time">
+        <!-- CMD & System Maintenance Toolkit -->
+        <div class="sh-card">
+          <div class="sh-card-header">
+            <div>
+              <div class="sh-card-title">Hızlı Sistem & CMD Araçları</div>
+              <div class="sh-card-desc">Seçili cihaza güvenli sistem ve ağ komutları gönderin.</div>
+            </div>
+          </div>
+          <div class="sh-card-body">
+            <div class="form-group">
+              <label class="form-label">Hedef Bilgisayar</label>
+              <select class="sh-select" id="targetClient">
+                <option value="all">📢 Tüm İstemciler (Broadcast)</option>
+              </select>
             </div>
 
-            <button class="btn-primary" onclick="dispatchManualCommand()">Komutu Şimdi Gönder</button>
+            <label class="form-label">Hazır CMD & Bakım Komutları (Tek Tıkla Çalıştır)</label>
+            <div class="cmd-preset-grid">
+              <button class="btn btn-secondary btn-sm" onclick="runSelectedTarget('sys-info', {}, 'Donanım raporu istendi')">
+                📊 Sistem & RAM Raporu
+              </button>
+              <button class="btn btn-secondary btn-sm" onclick="runSelectedTarget('flush-dns', {}, 'DNS önbelleği temizleniyor')">
+                🌐 ipconfig /flushdns
+              </button>
+              <button class="btn btn-secondary btn-sm" onclick="runSelectedTarget('net-info', {}, 'Ağ yapılandırması çekiliyor')">
+                📡 ipconfig /all
+              </button>
+              <button class="btn btn-secondary btn-sm" onclick="runSelectedTarget('process-list', {}, 'Çalışan süreç listesi istendi')">
+                ⚙️ Çalışan Süreçler (Tasklist)
+              </button>
+              <button class="btn btn-secondary btn-sm" onclick="runSelectedTarget('clean-temp', {}, 'Temp temizliği başlatıldı')">
+                🧹 Temp & Cache Temizle
+              </button>
+              <button class="btn btn-secondary btn-sm" onclick="runSelectedTarget('gpupdate', {}, 'Grup ilkeleri güncelleniyor')">
+                🛡️ gpupdate /force
+              </button>
+            </div>
+
+            <div style="border-top:1px solid var(--border); margin:16px 0; padding-top:14px;">
+              <label class="form-label" style="margin-bottom:6px; display:block;">Windows Servisi Yeniden Başlat</label>
+              <div style="display:flex; gap:8px;">
+                <input type="text" class="sh-input" id="serviceName" placeholder="Örn: Spooler, w32time" value="w32time">
+                <button class="btn btn-primary" onclick="restartSelectedService()">Başlat</button>
+              </div>
+            </div>
           </div>
         </div>
 
-        <div class="panel-box" style="flex:1;">
-          <div class="panel-header"><h2>📋 İşlem & Saat Raporları</h2></div>
-          <div id="tasksList" style="padding:16px; display:flex; flex-direction:column; gap:12px; max-height:460px; overflow-y:auto;">
-            <span style="color:var(--text-muted); font-size:12px;">Henüz görev sonucu yok.</span>
+        <!-- Recent Command Outputs -->
+        <div class="sh-card">
+          <div class="sh-card-header">
+            <div>
+              <div class="sh-card-title">Komut Çıktıları ve Raporlar</div>
+              <div class="sh-card-desc">İstemcilerden dönen son işlem sonuçları.</div>
+            </div>
+          </div>
+          <div class="sh-card-body" id="tasksList" style="display:flex; flex-direction:column; gap:12px; max-height:480px; overflow-y:auto;">
+            <span style="color:var(--muted-fg); font-size:12px;">Henüz bir görev çalıştırılmadı.</span>
           </div>
         </div>
+
       </div>
+
+    </div>
+  </main>
+
+  <!-- Modal: Set Custom Time -->
+  <div class="modal-overlay" id="timeModal">
+    <div class="modal-dialog">
+      <h3 style="font-size:16px; font-weight:600; margin-bottom:4px;" id="modalTitle">Saat Ayarla</h3>
+      <p style="font-size:12px; color:var(--muted-fg); margin-bottom:16px;">İstemci saatini doğrudan belirleyin veya dakika bazlı kaydırın.</p>
+
+      <div class="form-group">
+        <label class="form-label">Tam Saat Girin (SS:DD:SN)</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" class="sh-input" id="customTimeInput" placeholder="14:30:00">
+          <button class="btn btn-primary" onclick="applyCustomTimeString()">Uygula</button>
+        </div>
+      </div>
+
+      <label class="form-label">Hızlı İleri / Geri Kaydır</label>
+      <div class="offset-btns">
+        <button class="btn btn-secondary btn-sm" onclick="applyTimeOffset(-60)">-1 Saat</button>
+        <button class="btn btn-secondary btn-sm" onclick="applyTimeOffset(-5)">-5 Dk</button>
+        <button class="btn btn-secondary btn-sm" onclick="applyTimeOffset(5)">+5 Dk</button>
+        <button class="btn btn-secondary btn-sm" onclick="applyTimeOffset(60)">+1 Saat</button>
+      </div>
+
+      <button class="btn btn-outline" style="width:100%;" onclick="closeTimeModal()">Vazgeç</button>
     </div>
   </div>
 
-  <div class="modal-backdrop" id="timeModal">
-    <div class="modal-card">
-      <h3 id="modalTitle">✏️ Saat Ayarla</h3>
-      <p id="modalSub">Seçili istemci için yeni saati girin veya hızlı kaydırma uygulayın.</p>
-      
-      <label style="font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">Tam Saat Belirle (SS:DD:SN)</label>
-      <input type="text" id="customTimeInput" placeholder="Örn: 14:30:00">
-      <button class="btn-primary" onclick="applyCustomTimeString()">Bu Saate Ayarla</button>
-
-      <div style="margin: 14px 0 8px; font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">Veya Hızlı İleri / Geri Kaydır</div>
-      <div class="offset-grid">
-        <button class="quick-chip" style="margin:0; padding:8px;" onclick="applyTimeOffset(-60)">-1 Saat</button>
-        <button class="quick-chip" style="margin:0; padding:8px;" onclick="applyTimeOffset(-5)">-5 Dk</button>
-        <button class="quick-chip" style="margin:0; padding:8px;" onclick="applyTimeOffset(5)">+5 Dk</button>
-        <button class="quick-chip" style="margin:0; padding:8px;" onclick="applyTimeOffset(60)">+1 Saat</button>
-      </div>
-
-      <button onclick="closeTimeModal()" style="background:#1e293b; color:#cbd5e1; border:none; margin-top:8px; cursor:pointer; margin-bottom:0;">Kapat</button>
-    </div>
-  </div>
+  <!-- Toast Container -->
+  <div class="toast-wrap" id="toastWrap"></div>
 
   <script>
     let initialServerVersion = null;
@@ -725,10 +1069,21 @@ function getDashboardHtml() {
     let lastFetchLocalMs = Date.now();
     let modalTargetClient = 'all';
 
+    function showToast(msg) {
+      const wrap = document.getElementById('toastWrap');
+      const el = document.createElement('div');
+      el.className = 'toast';
+      el.textContent = '✓ ' + msg;
+      wrap.appendChild(el);
+      setTimeout(() => el.remove(), 3000);
+    }
+
     function tickClocks() {
       const nowServer = new Date(Date.now() + serverOffsetMs);
       document.getElementById('masterClock').textContent = nowServer.toLocaleTimeString('tr-TR');
-      document.getElementById('masterDate').textContent = nowServer.toLocaleDateString('tr-TR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+      document.getElementById('masterDate').textContent = nowServer.toLocaleDateString('tr-TR', {
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+      });
 
       const elapsedSinceFetch = Date.now() - lastFetchLocalMs;
       latestClients.forEach(c => {
@@ -740,10 +1095,6 @@ function getDashboardHtml() {
       });
     }
     setInterval(tickClocks, 500);
-
-    document.getElementById('actionSelect').addEventListener('change', function() {
-      document.getElementById('serviceParamDiv').style.display = this.value === 'restart-service' ? 'block' : 'none';
-    });
 
     async function loadDashboard() {
       try {
@@ -763,7 +1114,7 @@ function getDashboardHtml() {
         }
         latestClients = data.clients || [];
 
-        document.getElementById('serverVer').textContent = 'v' + data.serverVersion;
+        document.getElementById('serverVer').textContent = data.serverVersion;
         document.getElementById('statTotal').textContent = data.stats.total;
         document.getElementById('statOnline').textContent = data.stats.online;
         document.getElementById('statSynced').textContent = data.stats.synced;
@@ -771,65 +1122,79 @@ function getDashboardHtml() {
 
         if (data.remoteVersion && data.remoteVersion.lastChecked) {
           const shortSha = (data.remoteVersion.commitSha || '').slice(0, 7);
-          document.getElementById('githubCheckInfo').textContent = 'Son GitHub Kontrolü: ' + data.remoteVersion.lastChecked + ' (' + shortSha + ')';
+          document.getElementById('githubCheckInfo').textContent = 'Son Kontrol: ' + data.remoteVersion.lastChecked + ' (' + shortSha + ')';
         }
 
-        const tbody = document.getElementById('clientsTable');
+        const listEl = document.getElementById('clientsList');
         const targetSelect = document.getElementById('targetClient');
         const currentTarget = targetSelect.value;
         targetSelect.innerHTML = '<option value="all">📢 Tüm İstemciler (Broadcast)</option>';
 
         if (latestClients.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:30px;">Bağlı istemci bekleniyor...</td></tr>';
+          listEl.innerHTML = '<div style="text-align:center; color:var(--muted-fg); padding:32px; font-size:13px;">Henüz bağlı istemci yok.</div>';
         } else {
-          tbody.innerHTML = latestClients.map(c => {
-            targetSelect.innerHTML += \`<option value="\${c.id}">\${c.hostname} (\${c.id})</option>\`;
-            
+          listEl.innerHTML = latestClients.map(c => {
+            targetSelect.innerHTML += \`<option value="\${c.id}">\${c.id} (\${c.hostname} - \${c.ip})</option>\`;
+
             const drift = c.driftSeconds || 0;
             const absDrift = Math.abs(drift);
             let driftClass = 'drift-ok';
-            let driftLabel = 'TAM SENKRON (' + (drift >= 0 ? '+' : '') + drift + 'sn)';
+            let driftLabel = 'Tam Senkron (' + (drift >= 0 ? '+' : '') + drift + 'sn)';
             if (absDrift > 10) {
               driftClass = 'drift-bad';
-              driftLabel = 'SAAT FARKLI (' + (drift >= 0 ? '+' : '') + drift + 'sn)';
+              driftLabel = 'Saat Farklı (' + (drift >= 0 ? '+' : '') + drift + 'sn)';
             } else if (absDrift > 2) {
               driftClass = 'drift-warn';
-              driftLabel = 'HAFİF KAYMA (' + (drift >= 0 ? '+' : '') + drift + 'sn)';
+              driftLabel = 'Hafif Kayma (' + (drift >= 0 ? '+' : '') + drift + 'sn)';
             }
 
             const initClockStr = new Date(c.estimatedClientMs).toLocaleTimeString('tr-TR');
 
             return \`
-              <tr>
-                <td>
-                  <div style="display:flex; align-items:center;">
-                    <span class="pulse-dot \${c.isOnline ? 'pulse-online' : 'pulse-offline'}"></span>
+              <div class="client-item">
+                <div class="client-row-top">
+                  <div class="client-identity">
+                    <span class="status-dot \${c.isOnline ? 'status-online' : 'status-offline'}"></span>
                     <div>
-                      <strong style="color:#fff; font-size:14px;">\${c.id}</strong>
-                      <div style="font-size:11px; color:var(--text-muted); font-family:'JetBrains Mono';">\${c.hostname} • \${c.ip}</div>
+                      <div class="client-name">
+                        <span>\${c.id}</span>
+                        <span class="badge-outline" style="font-size:10px; padding:1px 7px;">v\${c.version || '1.0.0'}</span>
+                      </div>
+                      <div class="client-meta">\${c.hostname} • \${c.ip} • \${c.diffSeconds}sn önce</div>
                     </div>
                   </div>
-                </td>
-                <td>
-                  <div class="client-clock-wrap">
-                    <div class="client-digital-clock" id="clock-\${c.id}">\${initClockStr}</div>
-                    <div style="font-size:11px; color:var(--text-muted); font-family:'JetBrains Mono';">\${c.systemDate || ''}</div>
+                  <span class="drift-pill \${driftClass}">\${driftLabel}</span>
+                </div>
+
+                <div class="client-clock-panel">
+                  <div>
+                    <div style="font-size:10px; color:var(--muted-fg); text-transform:uppercase; font-weight:600;">İstemci Canlı Saati</div>
+                    <div class="client-digital" id="clock-\${c.id}">\${initClockStr}</div>
                   </div>
-                </td>
-                <td>
-                  <span class="drift-tag \${driftClass}">\${driftLabel}</span>
-                </td>
-                <td>
-                  <span style="font-family:'JetBrains Mono'; font-size:11px; color:var(--primary);">v\${c.version || '1.0.0'}</span>
-                  <div style="font-size:10px; color:var(--text-muted);">\${c.diffSeconds}sn önce</div>
-                </td>
-                <td style="text-align:right; white-space:nowrap;">
-                  <button class="quick-chip sync-btn" onclick="quickAction('\${c.id}', 'sync-server-time')" title="Sunucu Saatine Anında Eşitle">⚡ Eşitle</button>
-                  <button class="quick-chip" onclick="quickAction('\${c.id}', 'sync-ntp')" title="Windows NTP Senkronizasyonu">🌐 NTP</button>
-                  <button class="quick-chip" onclick="openTimeModal('\${c.id}')" title="Saati Manuel Değiştir">✏️ Saat Ayarla</button>
-                  <button class="quick-chip" onclick="quickAction('\${c.id}', 'clean-temp')" title="Temp Temizle">🧹</button>
-                </td>
-              </tr>
+                  <div style="text-align:right; font-family:'JetBrains Mono', monospace; font-size:12px; color:var(--muted-fg);">
+                    <div>\${c.systemDate || ''}</div>
+                    <div style="font-size:11px;">Uptime: \${c.uptime || '-'}</div>
+                  </div>
+                </div>
+
+                <div class="client-actions">
+                  <button class="btn btn-emerald btn-sm" onclick="quickAction('\${c.id}', 'sync-server-time', {}, '\${c.id} sunucu saatine eşitleniyor')">
+                    ⚡ Saati Eşitle
+                  </button>
+                  <button class="btn btn-secondary btn-sm" onclick="openTimeModal('\${c.id}')">
+                    ✏️ Saat Ayarla
+                  </button>
+                  <button class="btn btn-outline btn-sm" onclick="quickAction('\${c.id}', 'sync-ntp', {}, '\${c.id} NTP senkronizasyonu başlatıldı')">
+                    🌐 NTP Sync
+                  </button>
+                  <button class="btn btn-outline btn-sm" onclick="quickAction('\${c.id}', 'sys-info', {}, '\${c.id} sistem raporu istendi')">
+                    📊 Sistem Raporu
+                  </button>
+                  <button class="btn btn-outline btn-sm" onclick="quickAction('\${c.id}', 'flush-dns', {}, '\${c.id} DNS önbelleği temizleniyor')">
+                    🌐 DNS Temizle
+                  </button>
+                </div>
+              </div>
             \`;
           }).join('');
         }
@@ -837,27 +1202,22 @@ function getDashboardHtml() {
 
         const logStream = document.getElementById('logStream');
         if (data.logs && data.logs.length > 0) {
-          logStream.innerHTML = data.logs.map(l => \`
-            <div class="log-row">
-              <span class="log-time">[\${l.time}]</span>
-              <span class="log-msg">\${l.message}</span>
-            </div>
-          \`).join('');
+          logStream.textContent = data.logs.map(l => \`[\${l.time}] \${l.message}\`).join('\\n');
         }
 
         const tasksDiv = document.getElementById('tasksList');
         if (data.tasks.length === 0) {
-          tasksDiv.innerHTML = '<span style="color:var(--text-muted); font-size:12px;">Henüz görev yürütülmedi.</span>';
+          tasksDiv.innerHTML = '<span style="color:var(--muted-fg); font-size:12px;">Henüz bir görev çalıştırılmadı.</span>';
         } else {
           tasksDiv.innerHTML = data.tasks.map(t => {
-            const outText = Object.entries(t.results || {}).map(([cId, res]) => \`[\${cId}]:\\n\${res}\`).join('\\n\\n') || 'İstemciye iletiliyor...';
+            const outText = Object.entries(t.results || {}).map(([cId, res]) => \`[\${cId}]:\\n\${res}\`).join('\\n\\n') || 'İstemci yanıtı bekleniyor...';
             return \`
-              <div style="background:#070b12; border:1px solid var(--border); border-radius:8px; padding:12px;">
-                <div style="display:flex; justify-content:space-between; margin-bottom:6px; font-size:12px;">
-                  <strong style="color:var(--primary);">\${t.action}</strong>
-                  <span style="color:var(--text-muted);">Hedef: \${t.targetClientId} | \${t.status}</span>
+              <div style="border:1px solid var(--border); border-radius:8px; padding:12px; background:#09090b;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; font-size:12px;">
+                  <span style="font-weight:600; font-family:'JetBrains Mono', monospace;">\${t.action}</span>
+                  <span style="color:var(--muted-fg); font-size:11px;">Hedef: \${t.targetClientId} • \${t.status}</span>
                 </div>
-                <pre class="code-out">\${outText}</pre>
+                <div class="terminal-box" style="max-height:140px;">\${outText}</div>
               </div>
             \`;
           }).join('');
@@ -865,7 +1225,8 @@ function getDashboardHtml() {
       } catch (e) {}
     }
 
-    async function quickAction(clientId, action, params = {}) {
+    async function quickAction(clientId, action, params = {}, toastMsg = '') {
+      if (toastMsg) showToast(toastMsg);
       await fetch('/api/tasks/dispatch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -874,9 +1235,21 @@ function getDashboardHtml() {
       loadDashboard();
     }
 
+    function runSelectedTarget(action, params = {}, label = '') {
+      const target = document.getElementById('targetClient').value;
+      quickAction(target, action, params, label + ' (' + target + ')');
+    }
+
+    function restartSelectedService() {
+      const target = document.getElementById('targetClient').value;
+      const serviceName = document.getElementById('serviceName').value.trim();
+      if (!serviceName) return;
+      quickAction(target, 'restart-service', { serviceName }, serviceName + ' servisi yeniden başlatılıyor');
+    }
+
     function openTimeModal(clientId) {
       modalTargetClient = clientId;
-      document.getElementById('modalTitle').textContent = '✏️ Saat Ayarla (' + (clientId === 'all' ? 'Tüm İstemciler' : clientId) + ')';
+      document.getElementById('modalTitle').textContent = 'Saat Ayarla — ' + (clientId === 'all' ? 'Tüm İstemciler' : clientId);
       document.getElementById('customTimeInput').value = new Date(Date.now() + serverOffsetMs).toLocaleTimeString('tr-TR');
       document.getElementById('timeModal').style.display = 'flex';
     }
@@ -888,21 +1261,14 @@ function getDashboardHtml() {
     async function applyCustomTimeString() {
       const timeString = document.getElementById('customTimeInput').value.trim();
       if (!timeString) return;
-      await quickAction(modalTargetClient, 'set-custom-time', { timeString });
+      await quickAction(modalTargetClient, 'set-custom-time', { timeString }, 'Yeni saat ayarlandı: ' + timeString);
       closeTimeModal();
     }
 
     async function applyTimeOffset(offsetMinutes) {
-      await quickAction(modalTargetClient, 'set-custom-time', { offsetMinutes });
+      const sign = offsetMinutes > 0 ? '+' : '';
+      await quickAction(modalTargetClient, 'set-custom-time', { offsetMinutes }, 'Saat kaydırıldı (' + sign + offsetMinutes + ' dk)');
       closeTimeModal();
-    }
-
-    async function dispatchManualCommand() {
-      const targetClientId = document.getElementById('targetClient').value;
-      const action = document.getElementById('actionSelect').value;
-      const serviceName = document.getElementById('serviceName').value;
-      const params = action === 'restart-service' ? { serviceName } : {};
-      await quickAction(targetClientId, action, params);
     }
 
     loadDashboard();
@@ -913,7 +1279,7 @@ function getDashboardHtml() {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-  addLog('system', `WinOps Saat & Sistem Yönetim Sunucusu başlatıldı (v${SERVER_VERSION}) - Port: ${PORT}`);
+  addLog('system', `WinOps shadcn/ui Konsolu başlatıldı (v${SERVER_VERSION}) - Port: ${PORT}`);
   console.log(`[WinOps Server v${SERVER_VERSION}] http://0.0.0.0:${PORT} adresinde çalışıyor`);
   sendTelegramNotification(`🚀 *WinOps Yönetim Sunucusu Başlatıldı (v${SERVER_VERSION})*\nPort: ${PORT}`);
 });

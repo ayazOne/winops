@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.3.0)
-    10-Saniyelik Zero-Cache GitHub OTA Güncelleme & Anlık Saat Kontrolü
+    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.4.0)
+    10-Saniyelik Zero-Cache GitHub OTA Güncelleme, Anlık Saat Kontrolü & Onaylı Sistem Araçları
 #>
 
 [CmdletBinding()]
@@ -19,15 +19,8 @@ param (
     [string]$GitHubRepo = "ayazOne/winops"
 )
 
-$AgentVersion = "1.3.0"
+$AgentVersion = "1.4.0"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host " WinOps İstemci Ajanı (v$AgentVersion) Başlatılıyor... " -ForegroundColor Cyan
-Write-Host " İstemci ID  : $ClientId                     " -ForegroundColor Yellow
-Write-Host " Sunucu URL  : $ServerUrl                    " -ForegroundColor Yellow
-Write-Host " GitHub Repo : $GitHubRepo                   " -ForegroundColor Yellow
-Write-Host "=============================================" -ForegroundColor Cyan
 
 function Get-LocalIPv4 {
     try {
@@ -72,8 +65,6 @@ function Invoke-AgentSelfUpdate {
         $remoteMeta = Invoke-RestMethod -Uri $versionUrl -TimeoutSec 8 -ErrorAction Stop
 
         if ($remoteMeta.clientVersion -and ($remoteMeta.clientVersion -ne $AgentVersion)) {
-            Write-Host "[OTA] Yeni sürüm algılandı: v$($remoteMeta.clientVersion) (Mevcut: v$AgentVersion). Otomatik indiriliyor..." -ForegroundColor Green
-            
             $remoteScriptUrl = "https://raw.githubusercontent.com/$GitHubRepo/$ref/client/ClientAgent.ps1?t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
             $tempFile = "$env:TEMP\ClientAgent_new.ps1"
             Invoke-RestMethod -Uri $remoteScriptUrl -OutFile $tempFile -TimeoutSec 12 -ErrorAction Stop
@@ -89,8 +80,6 @@ function Invoke-AgentSelfUpdate {
             Copy-Item -Path $tempFile -Destination $currentScriptPath -Force
             Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
 
-            Write-Host "[OTA] Güncelleme tamamlandı (v$($remoteMeta.clientVersion)). Yeniden başlatılıyor..." -ForegroundColor Green
-            
             Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$currentScriptPath`" -ServerUrl `"$ServerUrl`" -ClientId `"$ClientId`" -GitHubRepo `"$GitHubRepo`""
             Start-Sleep -Seconds 1
             Stop-Process -Id $PID -Force
@@ -103,7 +92,7 @@ function Invoke-AgentSelfUpdate {
     }
 }
 
-# --- Onaylı Saat ve Bakım Eylemleri ---
+# --- Onaylı Saat ve Sistem Bakım Eylemleri (Güvenli Whitelist) ---
 function Invoke-MaintenanceAction {
     param (
         [string]$Action,
@@ -181,7 +170,43 @@ function Invoke-MaintenanceAction {
                     }
                 }
             }
-            $output = "Önbellek temizliği tamamlandı. Silinen öğe: $cleanedCount"
+            $output = "Önbellek temizliği tamamlandı. Silinen geçici öğe: $cleanedCount"
+        }
+
+        "flush-dns" {
+            try {
+                $res = & ipconfig /flushdns 2>&1 | Out-String
+                $output = "DNS Önbelleği Temizlendi:`n$($res.Trim())"
+            } catch {
+                $output = "DNS temizleme hatası: $($_.Exception.Message)"
+            }
+        }
+
+        "net-info" {
+            try {
+                $res = & ipconfig /all 2>&1 | Out-String
+                $output = $res.Trim()
+            } catch {
+                $output = "Ağ bilgisi hatası: $($_.Exception.Message)"
+            }
+        }
+
+        "process-list" {
+            try {
+                $procs = Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 15 Name, Id, @{Name="RAM_MB";Expression={[math]::Round($_.WorkingSet64 / 1MB, 1)}} | Format-Table -AutoSize | Out-String
+                $output = "En Çok Bellek Kullanan 15 Süreç:`n$($procs.Trim())"
+            } catch {
+                $output = "Süreç listesi hatası: $($_.Exception.Message)"
+            }
+        }
+
+        "gpupdate" {
+            try {
+                $res = & gpupdate /force /wait:0 2>&1 | Out-String
+                $output = "Grup İlkeleri (GPO) Güncellendi:`n$($res.Trim())"
+            } catch {
+                $output = "GPO güncelleme hatası: $($_.Exception.Message)"
+            }
         }
 
         "restart-service" {
@@ -234,10 +259,8 @@ $cachedOsCaption = (Get-CimInstance Win32_OperatingSystem).Caption
 $cachedIp = Get-LocalIPv4
 $cachedTz = (Get-TimeZone).Id
 
-# --- Ana Döngü (3sn Saat Senkron & 10sn GitHub OTA) ---
 while ($true) {
     try {
-        # Her 10 saniyede bir doğrudan GitHub OTA sürüm kontrolü (Zero-Cache)
         if ((Get-Date).Subtract($lastUpdateCheck).TotalSeconds -ge 10) {
             $lastUpdateCheck = Get-Date
             $cachedIp = Get-LocalIPv4
@@ -247,7 +270,6 @@ while ($true) {
         $now = Get-Date
         $epochMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
 
-        # 1. Heartbeat + Anlık Saat Gönderimi
         $heartbeatData = @{
             clientId   = $ClientId
             hostname   = $env:COMPUTERNAME
@@ -263,12 +285,10 @@ while ($true) {
 
         $hbResp = Invoke-RestMethod -Uri "$ServerUrl/api/heartbeat" -Method POST -Body $heartbeatData -ContentType "application/json" -TimeoutSec 5 -ErrorAction Stop
 
-        # Sunucu yeni bir sürüm olduğunu bildirirse 1sn beklemeden anında güncelle!
         if ($hbResp.expectedClientVersion -and ($hbResp.expectedClientVersion -ne $AgentVersion)) {
             $null = Invoke-AgentSelfUpdate -CommitSha $hbResp.commitSha
         }
 
-        # 2. Görev Sorgulama (Poll)
         $pollUri = "$ServerUrl/api/tasks/poll?clientId=$([System.Web.HttpUtility]::UrlEncode($ClientId))"
         $pollResp = Invoke-RestMethod -Uri $pollUri -Method GET -TimeoutSec 5 -ErrorAction Stop
 
@@ -307,9 +327,7 @@ while ($true) {
             $null = Invoke-RestMethod -Uri "$ServerUrl/api/tasks/result" -Method POST -Body $reportData -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
         }
 
-    } catch {
-        Write-Warning "[Bağlantı Hatası] ($ServerUrl): $($_.Exception.Message)"
-    }
+    } catch {}
 
     Start-Sleep -Seconds $PollIntervalSeconds
 }
