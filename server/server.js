@@ -132,7 +132,7 @@ function getLatestGitCommitSha() {
   return new Promise((resolve) => {
     const req = https.get(
       `https://github.com/${GITHUB_REPO}/info/refs?service=git-upload-pack&t=${Date.now()}`,
-      { headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' } },
+      { headers: { 'User-Agent': 'git/2.40.0', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' } },
       (res) => {
         let data = '';
         res.on('data', chunk => { data += chunk.toString('utf8'); });
