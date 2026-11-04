@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param (
     [Parameter(Mandatory = $false)]
-    [string]$ServerUrl = "http://127.0.0.1:3000",
+    [string]$ServerUrl = "http://127.0.0.1:3001",
 
     [Parameter(Mandatory = $false)]
     [string]$ClientId = $env:COMPUTERNAME,

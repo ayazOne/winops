@@ -10,8 +10,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const SERVER_VERSION = '1.3.0';
-const PORT = process.env.PORT || 3000;
+const SERVER_VERSION = '1.3.1';
+const PORT = process.env.PORT || 3001;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'ayazOne/winops';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';

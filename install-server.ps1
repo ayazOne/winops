@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-    WinOps Sunucu Kurulum Otomasyonu (Zero-Cache 10sn Otonom Güncelleme & Port Temizliği)
+    WinOps Sunucu Kurulum Otomasyonu (Port 3001 - Zero-Cache 10sn Otonom Güncelleme)
 #>
 
 [CmdletBinding()]
 param (
     [Parameter(Mandatory = $false)]
-    [int]$Port = 3000,
+    [int]$Port = 3001,
 
     [Parameter(Mandatory = $false)]
     [string]$TelegramBotToken = "",
@@ -22,22 +22,17 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 Write-Host "==========================================" -ForegroundColor Green
-Write-Host "  WinOps Sunucu Kuruluyor (GitHub: $GitHubRepo)" -ForegroundColor Green
+Write-Host "  WinOps Sunucu Kuruluyor (Port: $Port)"    -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Green
 
-# 1. Portu (3000) işgal eden tüm eski süreçleri ve görevleri kapat ("Upgrade Required" çakışmasını önler)
+# 1. Yalnızca eski WinOps süreçlerini kapat (Diğer Node.js servislerine / Port 3000'e dokunmaz!)
 $TaskName = "WinOpsServerService"
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
 Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe' OR Name = 'node.exe'" -ErrorAction SilentlyContinue | Where-Object {
-    $_.CommandLine -match "WinOps" -or $_.CommandLine -match "server\.js" -or $_.CommandLine -match "start\.bat"
+    $_.CommandLine -match "C:\\WinOps\\Server"
 } | ForEach-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-}
-
-Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | Where-Object { $_ -gt 4 } | ForEach-Object {
-    Write-Host "[!] Port $Port kullanan eski süreç (PID: $_) durduruluyor..." -ForegroundColor Yellow
-    Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Seconds 1
 
@@ -113,7 +108,6 @@ Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Silent
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings | Out-Null
 Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
-# Anında çalışmasını garanti altına almak için arka plan sürecini tetikle
 Start-Sleep -Seconds 1
 if (-not (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) {
     Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$InstallDir\start.bat`"" -WindowStyle Hidden
@@ -123,7 +117,7 @@ Write-Host "[2/4] Güvenlik duvarı kuralı ekleniyor (Port $Port)..." -Foregrou
 New-NetFirewallRule -DisplayName "WinOps Server $Port" -Direction Inbound -LocalPort $Port -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
 
 Write-Host "[3/4] Masaüstüne 'WinOps Takip Konsolu' kısayolu eklendi!" -ForegroundColor Cyan
-Write-Host "[4/4] Sunucu (v1.3.0) başlatıldı! 10 saniyelik otonom GitHub güncellemesi aktif!" -ForegroundColor Green
+Write-Host "[4/4] Sunucu Port $Port üzerinde başlatıldı! 10sn otonom GitHub güncellemesi aktif!" -ForegroundColor Green
 
 Start-Sleep -Seconds 2
 & "$InstallDir\Open-Dashboard.cmd"
