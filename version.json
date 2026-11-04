@@ -1,0 +1,7 @@
+{
+  "version": "1.0.0",
+  "serverVersion": "1.0.0",
+  "clientVersion": "1.0.0",
+  "repo": "ayazOne/winops",
+  "releaseNotes": "İlk kararlı sürüm: Merkezi yönetim, NTP senkronizasyonu, OTA otomatik güncelleme."
+}
