@@ -1,7 +1,7 @@
 {
-  "version": "1.0.1",
-  "serverVersion": "1.0.1",
-  "clientVersion": "1.0.0",
+  "version": "1.1.0",
+  "serverVersion": "1.1.0",
+  "clientVersion": "1.1.0",
   "repo": "ayazOne/winops",
-  "releaseNotes": "NOC Canlı Takip Konsolu, İstemci bazında hızlı bakım butonları ve Canlı Hareket Akışı (Live Ticker) eklendi."
+  "releaseNotes": "Tam otonom (zero-click) kendi kendini güncelleme (45sn kontrol), self-healing loop ve NOC takip konsolu otomatik açılışı eklendi."
 }

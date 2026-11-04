@@ -1,5 +1,5 @@
 /**
- * Enterprise Windows Management Server with GitHub OTA Support & NOC Dashboard
+ * Enterprise Windows Management Server with Autonomous GitHub OTA & NOC Dashboard
  * Port: 3000
  * Zero external dependencies (native http, https, fs, path, crypto)
  */
@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const SERVER_VERSION = '1.0.1';
+const SERVER_VERSION = '1.1.0';
 const PORT = process.env.PORT || 3000;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'ayazOne/winops';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -19,10 +19,11 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 // Storage
 const clients = new Map();
 const tasks = [];
-const eventLogs = []; // Live activity feed
+const eventLogs = [];
 const ALLOWED_ACTIONS = ['sync-ntp', 'clean-temp', 'restart-service', 'sys-info', 'update-agent'];
 
-let remoteVersionCache = { serverVersion: SERVER_VERSION, clientVersion: '1.0.0', lastChecked: 0 };
+let remoteVersionCache = { serverVersion: SERVER_VERSION, clientVersion: '1.1.0', lastChecked: 0 };
+let isUpdatingServer = false;
 
 function addLog(type, message) {
   const logEntry = {
@@ -57,31 +58,69 @@ function sendTelegramNotification(message) {
   req.end();
 }
 
-function checkGitHubVersion() {
-  return new Promise((resolve) => {
-    const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/version.json?t=${Date.now()}`;
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => {
+function performServerSelfUpdate(newVersion) {
+  if (isUpdatingServer) return;
+  isUpdatingServer = true;
+  addLog('system', `[OTA] Yeni sunucu sürümü algılandı (v${newVersion}). Otomatik indiriliyor...`);
+
+  const rawUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/server/server.js?t=${Date.now()}`;
+  https.get(rawUrl, (resp) => {
+    let code = '';
+    resp.on('data', c => { code += c; });
+    resp.on('end', () => {
+      if (resp.statusCode === 200 && code.includes('Enterprise Windows Management Server')) {
         try {
-          const parsed = JSON.parse(data);
-          remoteVersionCache = {
-            serverVersion: parsed.serverVersion || SERVER_VERSION,
-            clientVersion: parsed.clientVersion || '1.0.0',
-            lastChecked: Date.now()
-          };
-          resolve(remoteVersionCache);
-        } catch (e) {
-          resolve(remoteVersionCache);
+          const serverPath = path.join(__dirname, 'server.js');
+          fs.writeFileSync(serverPath, code, 'utf8');
+          addLog('system', `[OTA] Sunucu v${newVersion} sürümüne güncellendi. Yeniden başlatılıyor...`);
+          sendTelegramNotification(`🔄 *Sunucu Otomatik Güncellendi (v${SERVER_VERSION} -> v${newVersion})*\nYeniden başlatılıyor...`);
+          setTimeout(() => {
+            process.exit(0); // start.bat döngüsü 2 saniye içinde otomatik yeniden başlatır
+          }, 1500);
+        } catch (err) {
+          isUpdatingServer = false;
+          addLog('error', `[OTA Hatası] Dosya yazılamadı: ${err.message}`);
         }
-      });
-    }).on('error', () => resolve(remoteVersionCache));
+      } else {
+        isUpdatingServer = false;
+        addLog('error', `[OTA Hatası] GitHub'dan geçerli sunucu kodu alınamadı (HTTP ${resp.statusCode}).`);
+      }
+    });
+  }).on('error', err => {
+    isUpdatingServer = false;
+    addLog('error', `[OTA Bağlantı Hatası] ${err.message}`);
   });
 }
 
-checkGitHubVersion();
-setInterval(checkGitHubVersion, 15 * 60 * 1000);
+function checkGitHubVersionAndAutoUpdate() {
+  const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/version.json?t=${Date.now()}`;
+  https.get(url, (res) => {
+    let data = '';
+    res.on('data', chunk => { data += chunk; });
+    res.on('end', () => {
+      try {
+        if (res.statusCode !== 200) return;
+        const parsed = JSON.parse(data);
+        remoteVersionCache = {
+          serverVersion: parsed.serverVersion || SERVER_VERSION,
+          clientVersion: parsed.clientVersion || '1.1.0',
+          lastChecked: new Date().toLocaleTimeString('tr-TR')
+        };
+
+        // Sunucu sürümü farklıysa otomatik güncelle
+        if (parsed.serverVersion && parsed.serverVersion !== SERVER_VERSION) {
+          performServerSelfUpdate(parsed.serverVersion);
+        }
+      } catch (e) {
+        // JSON parse hatası yoksay
+      }
+    });
+  }).on('error', () => {});
+}
+
+// Başlangıçta ve her 45 saniyede bir GitHub'ı kontrol et (Otomatik Güncelleme)
+setTimeout(checkGitHubVersionAndAutoUpdate, 5000);
+setInterval(checkGitHubVersionAndAutoUpdate, 45 * 1000);
 
 function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
@@ -126,8 +165,10 @@ const server = http.createServer(async (req, res) => {
     try {
       const data = await parseJsonBody(req);
       const clientId = data.clientId || req.socket.remoteAddress;
-      const isNew = !clients.has(clientId);
-      
+      const existing = clients.get(clientId);
+      const isNew = !existing;
+      const versionChanged = existing && existing.version !== data.version;
+
       const clientInfo = {
         id: clientId,
         hostname: data.hostname || 'Unknown',
@@ -141,11 +182,18 @@ const server = http.createServer(async (req, res) => {
       clients.set(clientId, clientInfo);
 
       if (isNew) {
-        addLog('join', `Yeni istemci katıldı: [${clientId}] (${clientInfo.ip})`);
+        addLog('join', `Yeni istemci bağlandı: [${clientId}] (${clientInfo.ip}) - v${clientInfo.version}`);
         sendTelegramNotification(`🟢 *Yeni İstemci Bağlandı:*\nID: \`${clientId}\`\nHost: ${clientInfo.hostname}\nIP: ${clientInfo.ip}\nVersiyon: v${clientInfo.version}`);
+      } else if (versionChanged) {
+        addLog('system', `İstemci [${clientId}] yeni sürüme güncellendi: v${existing.version} -> v${clientInfo.version}`);
+        sendTelegramNotification(`✨ *İstemci Otomatik Güncellendi:*\nID: \`${clientId}\`\nYeni Sürüm: *v${clientInfo.version}*`);
       }
 
-      return jsonResponse(res, 200, { success: true, registered: true });
+      return jsonResponse(res, 200, {
+        success: true,
+        registered: true,
+        expectedClientVersion: remoteVersionCache.clientVersion
+      });
     } catch (e) {
       return jsonResponse(res, 400, { error: e.message });
     }
@@ -168,7 +216,7 @@ const server = http.createServer(async (req, res) => {
       if (pendingTask.targetClientId !== 'all') {
         pendingTask.status = 'in_progress';
       }
-      addLog('task_start', `Görev alındı: [${clientId}] -> ${pendingTask.action}`);
+      addLog('task_start', `Görev iletildi: [${clientId}] -> ${pendingTask.action}`);
       return jsonResponse(res, 200, { hasTask: true, task: pendingTask });
     }
 
@@ -216,7 +264,7 @@ const server = http.createServer(async (req, res) => {
       tasks.unshift(newTask);
       if (tasks.length > 100) tasks.pop();
 
-      addLog('dispatch', `Yeni görev kuyruğa atandı: ${action} -> Hedef: [${newTask.targetClientId}]`);
+      addLog('dispatch', `Yeni görev kuyrukta: ${action} -> Hedef: [${newTask.targetClientId}]`);
       sendTelegramNotification(`🚀 *Yeni Görev Kuyrukta:*\nKomut: *${action}*\nHedef: \`${newTask.targetClientId}\``);
       return jsonResponse(res, 200, { success: true, task: newTask });
     } catch (e) {
@@ -224,35 +272,10 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 5. Server Self-Update
-  if (req.method === 'POST' && pathname === '/api/server/self-update') {
-    try {
-      const rawUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/server/server.js?t=${Date.now()}`;
-      https.get(rawUrl, (resp) => {
-        let code = '';
-        resp.on('data', c => { code += c; });
-        resp.on('end', () => {
-          if (resp.statusCode === 200 && code.includes('Enterprise Windows Management Server')) {
-            const serverPath = path.join(__dirname, 'server.js');
-            fs.writeFileSync(serverPath, code, 'utf8');
-            addLog('system', 'Sunucu GitHub üzerinden güncellendi. Yeniden başlatılıyor...');
-            sendTelegramNotification(`🔄 *Sunucu GitHub üzerinden güncellendi ve yeniden başlatılıyor...*`);
-            jsonResponse(res, 200, { success: true, message: 'Sunucu güncellendi, yeniden başlatılıyor.' });
-
-            setTimeout(() => {
-              process.exit(0);
-            }, 1000);
-          } else {
-            jsonResponse(res, 500, { error: 'GitHub üzerinden yeni sürüm çekilemedi.' });
-          }
-        });
-      }).on('error', err => {
-        jsonResponse(res, 500, { error: err.message });
-      });
-      return;
-    } catch (e) {
-      return jsonResponse(res, 500, { error: e.message });
-    }
+  // 5. Force Immediate GitHub Check
+  if (req.method === 'POST' && pathname === '/api/server/check-update') {
+    checkGitHubVersionAndAutoUpdate();
+    return jsonResponse(res, 200, { success: true });
   }
 
   // 6. Admin API: Dashboard Data
@@ -261,7 +284,7 @@ const server = http.createServer(async (req, res) => {
     let onlineCount = 0;
     const clientList = Array.from(clients.values()).map(c => {
       const diffSeconds = Math.floor((now - new Date(c.lastSeen).getTime()) / 1000);
-      const isOnline = diffSeconds < 90;
+      const isOnline = diffSeconds < 60;
       if (isOnline) onlineCount++;
       return {
         ...c,
@@ -284,7 +307,7 @@ const server = http.createServer(async (req, res) => {
       serverVersion: SERVER_VERSION,
       githubRepo: GITHUB_REPO,
       remoteVersion: remoteVersionCache,
-      serverTime: new Date().toLocaleString('tr-TR')
+      isUpdatingServer
     });
   }
 
@@ -315,7 +338,6 @@ function getDashboardHtml() {
       --primary: #38bdf8;
       --primary-glow: rgba(56, 189, 248, 0.25);
       --success: #10b981;
-      --success-glow: rgba(16, 185, 129, 0.25);
       --danger: #ef4444;
       --warning: #f59e0b;
       --text: #f1f5f9;
@@ -341,36 +363,29 @@ function getDashboardHtml() {
       top: 0;
       z-index: 50;
     }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
+    .brand { display: flex; align-items: center; gap: 12px; }
     .brand-logo {
-      width: 36px;
-      height: 36px;
+      width: 36px; height: 36px;
       background: linear-gradient(135deg, #0284c7, #38bdf8);
       border-radius: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      display: flex; align-items: center; justify-content: center;
       font-size: 20px;
       box-shadow: 0 0 15px var(--primary-glow);
     }
-    .brand-title {
-      font-size: 18px;
-      font-weight: 700;
-      letter-spacing: -0.5px;
-    }
-    .brand-sub {
+    .brand-title { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .brand-sub { font-size: 11px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+    .header-right { display: flex; align-items: center; gap: 14px; }
+    .ota-pill {
       font-size: 11px;
-      color: var(--text-muted);
       font-family: 'JetBrains Mono', monospace;
-    }
-    .header-right {
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--success);
+      border: 1px solid rgba(16, 185, 129, 0.25);
       display: flex;
       align-items: center;
-      gap: 16px;
+      gap: 6px;
     }
     .live-clock {
       font-family: 'JetBrains Mono', monospace;
@@ -388,8 +403,6 @@ function getDashboardHtml() {
       margin: 0 auto;
       width: 100%;
     }
-    
-    /* Stats Bar */
     .stats-bar {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -405,51 +418,11 @@ function getDashboardHtml() {
       align-items: center;
       justify-content: space-between;
     }
-    .stat-info span {
-      font-size: 12px;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      font-weight: 600;
-      letter-spacing: 0.5px;
-    }
-    .stat-info h3 {
-      font-size: 26px;
-      font-weight: 700;
-      margin-top: 4px;
-      font-family: 'JetBrains Mono', monospace;
-    }
-    .stat-badge {
-      width: 44px;
-      height: 44px;
-      border-radius: 12px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 20px;
-    }
-
-    /* Update Alert Banner */
-    .update-banner {
-      background: rgba(245, 158, 11, 0.12);
-      border: 1px solid var(--warning);
-      border-radius: 10px;
-      padding: 12px 20px;
-      margin-bottom: 24px;
-      display: none;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    /* Content Grid */
-    .content-grid {
-      display: grid;
-      grid-template-columns: 2.2fr 1fr;
-      gap: 24px;
-    }
-    @media (max-width: 1100px) {
-      .content-grid { grid-template-columns: 1fr; }
-    }
-
+    .stat-info span { font-size: 12px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
+    .stat-info h3 { font-size: 26px; font-weight: 700; margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
+    .stat-badge { width: 44px; height: 44px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+    .content-grid { display: grid; grid-template-columns: 2.2fr 1fr; gap: 24px; }
+    @media (max-width: 1100px) { .content-grid { grid-template-columns: 1fr; } }
     .panel-box {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -464,84 +437,43 @@ function getDashboardHtml() {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      background: rgba(255, 255, 255, 0.01);
     }
-    .panel-header h2 {
-      font-size: 15px;
-      font-weight: 600;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    /* Tables */
+    .panel-header h2 { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
     table { width: 100%; border-collapse: collapse; text-align: left; }
     th, td { padding: 14px 18px; border-bottom: 1px solid var(--border); font-size: 13px; }
     th { color: var(--text-muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }
     tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
-
-    .pulse-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      display: inline-block;
-      margin-right: 6px;
-    }
+    .pulse-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
     .pulse-online { background: var(--success); box-shadow: 0 0 8px var(--success); }
     .pulse-offline { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
-
     .badge-chip {
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
       padding: 3px 8px;
       border-radius: 6px;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--border);
+      background: rgba(56, 189, 248, 0.1);
+      color: var(--primary);
+      border: 1px solid rgba(56, 189, 248, 0.25);
     }
-
-    /* Quick Action Chips */
     .quick-chip {
-      padding: 4px 10px;
+      padding: 5px 10px;
       border-radius: 6px;
       border: 1px solid var(--border);
       background: #1b263b;
       color: #cbd5e1;
       font-size: 11px;
       cursor: pointer;
-      font-family: inherit;
       transition: all 0.2s;
-      white-space: nowrap;
+      margin-left: 4px;
     }
-    .quick-chip:hover {
-      background: var(--primary);
-      color: #090d16;
-      border-color: var(--primary);
-    }
-
-    /* Form Controls */
+    .quick-chip:hover { background: var(--primary); color: #090d16; border-color: var(--primary); font-weight: 600; }
     select, input, button {
-      width: 100%;
-      padding: 10px 14px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: #090d16;
-      color: #fff;
-      margin-bottom: 12px;
-      font-size: 13px;
-      font-family: inherit;
+      width: 100%; padding: 10px 14px; border-radius: 8px;
+      border: 1px solid var(--border); background: #090d16; color: #fff;
+      margin-bottom: 12px; font-size: 13px; font-family: inherit;
     }
-    select:focus, input:focus { outline: none; border-color: var(--primary); }
-    button.btn-primary {
-      background: var(--primary);
-      color: #090d16;
-      font-weight: 600;
-      cursor: pointer;
-      border: none;
-      transition: opacity 0.2s;
-    }
+    button.btn-primary { background: var(--primary); color: #090d16; font-weight: 600; cursor: pointer; border: none; }
     button.btn-primary:hover { opacity: 0.9; }
-
-    /* Live Feed Logs */
     .log-stream {
       padding: 14px;
       font-family: 'JetBrains Mono', monospace;
@@ -553,26 +485,14 @@ function getDashboardHtml() {
       flex-direction: column;
       gap: 6px;
     }
-    .log-row {
-      display: flex;
-      gap: 10px;
-      line-height: 1.5;
-    }
+    .log-row { display: flex; gap: 10px; line-height: 1.5; }
     .log-time { color: var(--text-muted); }
-    .log-msg { color: #cbd5e1; word-break: break-all; }
-
-    /* Execution Output Blocks */
+    .log-msg { color: #cbd5e1; }
     pre.code-out {
-      background: #090d16;
-      padding: 10px 12px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      color: #38bdf8;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
-      max-height: 120px;
-      overflow-y: auto;
-      white-space: pre-wrap;
+      background: #090d16; padding: 10px 12px; border-radius: 6px;
+      border: 1px solid var(--border); color: #38bdf8;
+      font-family: 'JetBrains Mono', monospace; font-size: 11px;
+      max-height: 120px; overflow-y: auto; white-space: pre-wrap;
     }
   </style>
 </head>
@@ -583,63 +503,40 @@ function getDashboardHtml() {
       <div class="brand-logo">🪟</div>
       <div>
         <div class="brand-title">WinOps Merkezi Takip Konsolu</div>
-        <div class="brand-sub">Sürüm: <span id="serverVer">v1.0.1</span> | GitHub: <a href="https://github.com/ayazOne/winops" target="_blank" style="color:var(--primary); text-decoration:none;">ayazOne/winops</a></div>
+        <div class="brand-sub">Sunucu: <strong id="serverVer" style="color:var(--primary);">v1.1.0</strong> | GitHub: <a href="https://github.com/ayazOne/winops" target="_blank" style="color:var(--primary); text-decoration:none;">ayazOne/winops</a></div>
       </div>
     </div>
     <div class="header-right">
+      <div class="ota-pill" id="otaStatusPill">🔄 Otomatik Güncelleme: AKTİF (45sn)</div>
       <div class="live-clock" id="liveClock">00:00:00</div>
-      <button onclick="updateAllClients()" style="width:auto; padding:7px 14px; margin-bottom:0; background:#1e293b; color:#fff; border:1px solid var(--border); font-size:12px; cursor:pointer; border-radius:8px;">🚀 Tüm İstemcileri Güncelle (OTA)</button>
     </div>
   </header>
 
   <div class="main-layout">
-
-    <!-- Update Alert Banner -->
-    <div id="updateBanner" class="update-banner">
-      <span id="updateBannerText">🔔 GitHub üzerinde yeni bir sunucu sürümü mevcut!</span>
-      <button onclick="updateServer()" style="width:auto; padding:6px 16px; margin-bottom:0; background:var(--warning); color:#000; font-weight:700; border:none; border-radius:6px; cursor:pointer;">Sunucuyu Güncelle</button>
-    </div>
-
-    <!-- Stats Bar -->
     <div class="stats-bar">
       <div class="stat-card">
-        <div class="stat-info">
-          <span>Toplam İstemci</span>
-          <h3 id="statTotal">0</h3>
-        </div>
+        <div class="stat-info"><span>Toplam İstemci</span><h3 id="statTotal">0</h3></div>
         <div class="stat-badge" style="background:rgba(56, 189, 248, 0.1); color:var(--primary);">💻</div>
       </div>
       <div class="stat-card">
-        <div class="stat-info">
-          <span>Çevrimiçi (Online)</span>
-          <h3 id="statOnline" style="color:var(--success);">0</h3>
-        </div>
+        <div class="stat-info"><span>Çevrimiçi (Online)</span><h3 id="statOnline" style="color:var(--success);">0</h3></div>
         <div class="stat-badge" style="background:rgba(16, 185, 129, 0.1); color:var(--success);">⚡</div>
       </div>
       <div class="stat-card">
-        <div class="stat-info">
-          <span>Çevrimdışı (Offline)</span>
-          <h3 id="statOffline" style="color:var(--danger);">0</h3>
-        </div>
+        <div class="stat-info"><span>Çevrimdışı (Offline)</span><h3 id="statOffline" style="color:var(--danger);">0</h3></div>
         <div class="stat-badge" style="background:rgba(239, 68, 68, 0.1); color:var(--danger);">💤</div>
       </div>
       <div class="stat-card">
-        <div class="stat-info">
-          <span>Yürütülen Bakım</span>
-          <h3 id="statTasks">0</h3>
-        </div>
+        <div class="stat-info"><span>Yürütülen Bakım</span><h3 id="statTasks">0</h3></div>
         <div class="stat-badge" style="background:rgba(245, 158, 11, 0.1); color:var(--warning);">🛠️</div>
       </div>
     </div>
 
-    <!-- Main Content -->
     <div class="content-grid">
-      
-      <!-- Left: Client Table -->
       <div class="panel-box">
         <div class="panel-header">
           <h2>💻 İstemci Takip Listesi</h2>
-          <span style="font-size:12px; color:var(--text-muted);">Canlı Senkron: 3sn</span>
+          <span style="font-size:12px; color:var(--text-muted);" id="githubCheckInfo">GitHub Kontrolü: Bekleniyor...</span>
         </div>
         <table>
           <thead>
@@ -657,25 +554,19 @@ function getDashboardHtml() {
           </tbody>
         </table>
 
-        <!-- Live Activity Stream inside left panel -->
         <div class="panel-header" style="border-top:1px solid var(--border); margin-top:auto;">
           <h2>📡 Canlı Hareket Akışı (Live NOC Ticker)</h2>
         </div>
         <div class="log-stream" id="logStream">
-          <div class="log-row"><span class="log-time">[--:--:--]</span><span class="log-msg">Canlı log akışı başlatıldı.</span></div>
+          <div class="log-row"><span class="log-time">[--:--:--]</span><span class="log-msg">Sistem izleniyor...</span></div>
         </div>
       </div>
 
-      <!-- Right: Dispatch & Operations -->
       <div style="display:flex; flex-direction:column; gap:24px;">
-        
-        <!-- Manual Dispatch Card -->
         <div class="panel-box">
-          <div class="panel-header">
-            <h2>🎯 Komut Gönderici</h2>
-          </div>
+          <div class="panel-header"><h2>🎯 Toplu / Tekli Komut Gönderici</h2></div>
           <div style="padding:18px;">
-            <label style="font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">Hedef Seçimi</label>
+            <label style="font-size:11px; color:var(--text-muted); text-transform:uppercase; font-weight:600;">Hedef İstemci</label>
             <select id="targetClient">
               <option value="all">📢 Tüm İstemciler (Broadcast)</option>
             </select>
@@ -686,7 +577,7 @@ function getDashboardHtml() {
               <option value="clean-temp">🧹 Önbellek & Temp Temizliği</option>
               <option value="sys-info">📊 Donanım & Sistem Raporu</option>
               <option value="restart-service">🔄 Servis Yeniden Başlat</option>
-              <option value="update-agent">🚀 Ajanı Güncelle (OTA)</option>
+              <option value="update-agent">🚀 Ajanı Şimdi Güncelle (OTA)</option>
             </select>
 
             <div id="serviceParamDiv" style="display:none;">
@@ -698,27 +589,21 @@ function getDashboardHtml() {
           </div>
         </div>
 
-        <!-- Recent Task Results -->
         <div class="panel-box" style="flex:1;">
-          <div class="panel-header">
-            <h2>📋 Son Bakım Raporları</h2>
-          </div>
+          <div class="panel-header"><h2>📋 Son Bakım Raporları</h2></div>
           <div id="tasksList" style="padding:16px; display:flex; flex-direction:column; gap:12px; max-height:480px; overflow-y:auto;">
             <span style="color:var(--text-muted); font-size:12px;">Henüz görev sonucu yok.</span>
           </div>
         </div>
-
       </div>
-
     </div>
-
   </div>
 
   <script>
-    // Live Clock
+    let initialServerVersion = null;
+
     function updateClock() {
-      const now = new Date();
-      document.getElementById('liveClock').textContent = now.toLocaleTimeString('tr-TR') + ' (NOC)';
+      document.getElementById('liveClock').textContent = new Date().toLocaleTimeString('tr-TR') + ' (NOC)';
     }
     setInterval(updateClock, 1000);
     updateClock();
@@ -732,21 +617,30 @@ function getDashboardHtml() {
         const res = await fetch('/api/dashboard-data');
         const data = await res.json();
 
-        // Server version & stats
+        // Sunucu kendi kendini güncellediğinde açık olan web sayfasını da otomatik yenile!
+        if (!initialServerVersion) {
+          initialServerVersion = data.serverVersion;
+        } else if (initialServerVersion !== data.serverVersion) {
+          location.reload();
+          return;
+        }
+
         document.getElementById('serverVer').textContent = 'v' + data.serverVersion;
         document.getElementById('statTotal').textContent = data.stats.total;
         document.getElementById('statOnline').textContent = data.stats.online;
         document.getElementById('statOffline').textContent = data.stats.offline;
         document.getElementById('statTasks').textContent = data.stats.totalTasks;
 
-        // OTA Update Alert
-        if (data.remoteVersion && data.remoteVersion.serverVersion && data.remoteVersion.serverVersion !== data.serverVersion) {
-          const banner = document.getElementById('updateBanner');
-          document.getElementById('updateBannerText').textContent = '🔔 GitHub üzerinde yeni sunucu sürümü mevcut: v' + data.remoteVersion.serverVersion;
-          banner.style.display = 'flex';
+        if (data.remoteVersion && data.remoteVersion.lastChecked) {
+          document.getElementById('githubCheckInfo').textContent = 'Son GitHub Kontrolü: ' + data.remoteVersion.lastChecked + ' (Hedef Sürüm: v' + data.remoteVersion.clientVersion + ')';
         }
 
-        // Clients Table
+        if (data.isUpdatingServer) {
+          const pill = document.getElementById('otaStatusPill');
+          pill.textContent = '⚡ Sunucu Güncelleniyor...';
+          pill.style.color = '#f59e0b';
+        }
+
         const tbody = document.getElementById('clientsTable');
         const targetSelect = document.getElementById('targetClient');
         const currentTarget = targetSelect.value;
@@ -783,7 +677,6 @@ function getDashboardHtml() {
         }
         targetSelect.value = currentTarget;
 
-        // Live Log Stream
         const logStream = document.getElementById('logStream');
         if (data.logs && data.logs.length > 0) {
           logStream.innerHTML = data.logs.map(l => \`
@@ -794,7 +687,6 @@ function getDashboardHtml() {
           \`).join('');
         }
 
-        // Recent Task Results
         const tasksDiv = document.getElementById('tasksList');
         if (data.tasks.length === 0) {
           tasksDiv.innerHTML = '<span style="color:var(--text-muted); font-size:12px;">Henüz görev yürütülmedi.</span>';
@@ -812,10 +704,7 @@ function getDashboardHtml() {
             \`;
           }).join('');
         }
-
-      } catch (e) {
-        console.error('Yükleme hatası:', e);
-      }
+      } catch (e) {}
     }
 
     async function quickAction(clientId, action) {
@@ -833,47 +722,23 @@ function getDashboardHtml() {
       const serviceName = document.getElementById('serviceName').value;
       const params = action === 'restart-service' ? { serviceName } : {};
 
-      const res = await fetch('/api/tasks/dispatch', {
+      await fetch('/api/tasks/dispatch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ targetClientId, action, params })
       });
-      const data = await res.json();
-      if (data.success) {
-        loadDashboard();
-      } else {
-        alert('Hata: ' + data.error);
-      }
-    }
-
-    async function updateAllClients() {
-      if (!confirm('Tüm aktif istemcilere GitHub üzerinden güncelleme emri gönderilsin mi?')) return;
-      await fetch('/api/tasks/dispatch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetClientId: 'all', action: 'update-agent' })
-      });
       loadDashboard();
     }
 
-    async function updateServer() {
-      if (!confirm('Sunucu GitHub üzerinden güncellenip yeniden başlatılsın mı?')) return;
-      const res = await fetch('/api/server/self-update', { method: 'POST' });
-      const data = await res.json();
-      if (data.success) {
-        alert('Sunucu güncelleniyor. Sayfa 5 saniye sonra yenilenecek.');
-        setTimeout(() => location.reload(), 5000);
-      }
-    }
-
     loadDashboard();
-    setInterval(loadDashboard, 3000); // 3 saniyede bir canlı yenileme
+    setInterval(loadDashboard, 3000);
   </script>
 </body>
 </html>`;
 }
 
 server.listen(PORT, '0.0.0.0', () => {
+  addLog('system', `WinOps Yönetim Sunucusu başlatıldı (v${SERVER_VERSION}) - Port: ${PORT}`);
   console.log(`[WinOps Server v${SERVER_VERSION}] http://0.0.0.0:${PORT} adresinde çalışıyor`);
   sendTelegramNotification(`🚀 *WinOps Yönetim Sunucusu Başlatıldı (v${SERVER_VERSION})*\nPort: ${PORT}`);
 });

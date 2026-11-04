@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    WinOps Client Maintenance Agent with GitHub OTA Self-Update
-    Kurumsal Windows istemcileri için güvenli bakım, senkronizasyon ve otomatik güncelleme ajanı.
+    WinOps Client Maintenance Agent with Autonomous GitHub OTA Self-Update
+    Kurumsal Windows istemcileri için güvenli bakım, senkronizasyon ve otonom güncelleme ajanı.
 #>
 
 [CmdletBinding()]
@@ -19,7 +19,7 @@ param (
     [string]$GitHubRepo = "ayazOne/winops"
 )
 
-$AgentVersion = "1.0.0"
+$AgentVersion = "1.1.0"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 Write-Host "=============================================" -ForegroundColor Cyan
@@ -49,15 +49,14 @@ function Get-UptimeFormatted {
     }
 }
 
-# --- GitHub OTA Otomatik Güncelleme (Self-Update) ---
+# --- GitHub OTA Otonom Güncelleme (Zero-Click Self-Update) ---
 function Invoke-AgentSelfUpdate {
     try {
-        Write-Host "[OTA] GitHub sürüm kontrolü yapılıyor ($GitHubRepo)..." -ForegroundColor Yellow
         $versionUrl = "https://raw.githubusercontent.com/$GitHubRepo/main/version.json?t=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
         $remoteMeta = Invoke-RestMethod -Uri $versionUrl -TimeoutSec 10 -ErrorAction Stop
 
         if ($remoteMeta.clientVersion -and ($remoteMeta.clientVersion -ne $AgentVersion)) {
-            Write-Host "[OTA] Yeni sürüm bulundu: v$($remoteMeta.clientVersion) (Mevcut: v$AgentVersion). Güncelleniyor..." -ForegroundColor Green
+            Write-Host "[OTA] Yeni sürüm algılandı: v$($remoteMeta.clientVersion) (Mevcut: v$AgentVersion). Otomatik indiriliyor..." -ForegroundColor Green
             
             $remoteScriptUrl = "https://raw.githubusercontent.com/$GitHubRepo/main/client/ClientAgent.ps1?t=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
             $tempFile = "$env:TEMP\ClientAgent_new.ps1"
@@ -76,24 +75,22 @@ function Invoke-AgentSelfUpdate {
             Copy-Item -Path $tempFile -Destination $currentScriptPath -Force
             Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
 
-            Write-Host "[OTA] Güncelleme dosyası kaydedildi. Servis yeniden başlatılıyor..." -ForegroundColor Green
+            Write-Host "[OTA] Güncelleme tamamlandı (v$($remoteMeta.clientVersion)). Yeniden başlatılıyor..." -ForegroundColor Green
             
-            # Arka planda yeni sürümü başlat ve mevcut süreci sonlandır
+            # Yeni süreci başlat ve mevcut süreci kapat
             Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$currentScriptPath`" -ServerUrl `"$ServerUrl`" -ClientId `"$ClientId`" -GitHubRepo `"$GitHubRepo`""
-            
-            # Kısa bir gecikme sonrası mevcut oturumu kapat
-            Start-Sleep -Seconds 2
+            Start-Sleep -Seconds 1
             Stop-Process -Id $PID -Force
-            return "İstemci v$($remoteMeta.clientVersion) sürümüne güncellendi ve yeniden başlatıldı."
+            return "İstemci v$($remoteMeta.clientVersion) sürümüne güncellendi."
         } else {
-            return "İstemci zaten en güncel sürümde (v$AgentVersion)."
+            return "İstemci güncel (v$AgentVersion)."
         }
     } catch {
-        return "Otomatik güncelleme hatası: $($_.Exception.Message)"
+        return "OTA kontrol hatası: $($_.Exception.Message)"
     }
 }
 
-# --- Onaylı ve Güvenli Bakım Eylemleri (Whitelist Dispatcher) ---
+# --- Onaylı ve Güvenli Bakım Eylemleri ---
 function Invoke-MaintenanceAction {
     param (
         [string]$Action,
@@ -135,7 +132,7 @@ function Invoke-MaintenanceAction {
                     }
                 }
             }
-            $output = "Önbellek temizliği tamamlandı. Temizlenen dosya/klasör sayısı: $cleanedCount"
+            $output = "Önbellek temizliği tamamlandı. Temizlenen öğe sayısı: $cleanedCount"
         }
 
         "restart-service" {
@@ -177,26 +174,26 @@ C: Disk Durumu  : Boş: $($disk.FreeGB) GB / Kullanılan: $($disk.UsedGB) GB
         }
 
         default {
-            $output = "Hata: '$Action' tanımlı veya izin verilen bir bakım eylemi değil!"
+            $output = "Hata: '$Action' tanımlı bir bakım eylemi değil!"
         }
     }
 
     return $output
 }
 
-# Periyodik güncelleme sayacı (her 1 saatte bir arka planda kontrol)
+# Her 45 saniyede bir doğrudan GitHub OTA sürüm kontrolü
 $lastUpdateCheck = [DateTime]::MinValue
 
-# --- Ana Döngü (Heartbeat ve Görev Takibi) ---
+# --- Ana Döngü ---
 while ($true) {
     try {
-        # Saatte bir arka planda otomatik güncelleme denetimi
-        if ((Get-Date).Subtract($lastUpdateCheck).TotalMinutes -ge 60) {
+        # 1. Doğrudan GitHub üzerinden periyodik (45sn) otomatik güncelleme denetimi
+        if ((Get-Date).Subtract($lastUpdateCheck).TotalSeconds -ge 45) {
             $lastUpdateCheck = Get-Date
             $null = Invoke-AgentSelfUpdate
         }
 
-        # 1. Heartbeat Gönderimi
+        # 2. Heartbeat Gönderimi
         $heartbeatData = @{
             clientId = $ClientId
             hostname = $env:COMPUTERNAME
@@ -206,9 +203,14 @@ while ($true) {
             version  = $AgentVersion
         } | ConvertTo-Json
 
-        $null = Invoke-RestMethod -Uri "$ServerUrl/api/heartbeat" -Method POST -Body $heartbeatData -ContentType "application/json" -TimeoutSec 10 -ErrorAction Stop
+        $hbResp = Invoke-RestMethod -Uri "$ServerUrl/api/heartbeat" -Method POST -Body $heartbeatData -ContentType "application/json" -TimeoutSec 10 -ErrorAction Stop
 
-        # 2. Görev Sorgulama (Poll)
+        # Eğer sunucu yeni bir istemci sürümü olduğunu bildirirse anında güncelle!
+        if ($hbResp.expectedClientVersion -and ($hbResp.expectedClientVersion -ne $AgentVersion)) {
+            $null = Invoke-AgentSelfUpdate
+        }
+
+        # 3. Görev Sorgulama (Poll)
         $pollUri = "$ServerUrl/api/tasks/poll?clientId=$([System.Web.HttpUtility]::UrlEncode($ClientId))"
         $pollResp = Invoke-RestMethod -Uri $pollUri -Method GET -TimeoutSec 10 -ErrorAction Stop
 
@@ -221,11 +223,8 @@ while ($true) {
                 $task.params.psobject.properties | ForEach-Object { $paramHt[$_.Name] = $_.Value }
             }
 
-            # Onaylı eylemi çalıştır
             $taskResult = Invoke-MaintenanceAction -Action $task.action -Params $paramHt
-            Write-Host "[GÖREV SONUCU] `n$taskResult" -ForegroundColor Gray
 
-            # Sonucu Sunucuya Bildir
             $reportData = @{
                 taskId    = $task.id
                 clientId  = $ClientId
