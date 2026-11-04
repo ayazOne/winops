@@ -1,7 +1,7 @@
 {
-  "version": "1.5.1",
-  "serverVersion": "1.5.0",
-  "clientVersion": "1.5.1",
+  "version": "1.6.0",
+  "serverVersion": "1.6.0",
+  "clientVersion": "1.6.0",
   "repo": "ayazOne/winops",
-  "releaseNotes": "Standart kullanıcı (Admin olmayan CMD) desteği, Access Denied hatası çözümü ve PS 5.1 URI uyumluluğu (v1.5.1)."
+  "releaseNotes": "Sunucu merkezli kesin artan sayaç (PC-01, PC-02, PC-03...), tüm istemci listesi sıfırlama ve tekil silme eklendi (v1.6.0)."
 }

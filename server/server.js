@@ -1,6 +1,6 @@
 /**
- * Enterprise Windows Management Server - shadcn/ui Edition (v1.5.0)
- * Auto-Sequential Client ID (PC-01, PC-02, PC-03...) & Server-Side Rename
+ * Enterprise Windows Management Server - shadcn/ui Edition (v1.6.0)
+ * Strict Server-Side Sequential Counter (PC-01, PC-02, PC-03...) & Full List Reset
  * Port: 3001
  * Zero external dependencies (native http, https, fs, path, crypto)
  */
@@ -11,68 +11,56 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const SERVER_VERSION = '1.5.0';
+const SERVER_VERSION = '1.6.0';
 const PORT = process.env.PORT || 3001;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'ayazOne/winops';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
-const DB_FILE = path.join(__dirname, 'clients-db.json');
+// v1.6.0 ile birlikte sıfırdan temiz veritabanı dosyası
+const DB_FILE = path.join(__dirname, 'clients-registry-v16.json');
 
 // Storage
 const clients = new Map();
 const tasks = [];
 const eventLogs = [];
-const pendingRenames = new Map(); // oldId -> newId
+const pendingRenames = new Map(); // token -> newId
 
-// Persistent ID Registry: { byHost: { "GE018": "PC-01" }, counter: 1 }
-let idRegistry = { byHost: {}, counter: 0 };
+// Strict Server-Side Counter & Valid Token Registry
+let registry = {
+  counter: 0,
+  tokens: {} // token -> clientId (e.g. "tok_abc123" -> "PC-01")
+};
 
-function loadIdRegistry() {
+function loadRegistry() {
   try {
     if (fs.existsSync(DB_FILE)) {
-      const raw = fs.readFileSync(DB_FILE, 'utf8');
-      const parsed = JSON.parse(raw);
-      if (parsed && parsed.byHost) {
-        idRegistry = parsed;
+      const parsed = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+      if (parsed && typeof parsed.counter === 'number') {
+        registry = parsed;
       }
+    } else {
+      saveRegistry();
     }
   } catch (e) {}
 }
 
-function saveIdRegistry() {
+function saveRegistry() {
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(idRegistry, null, 2), 'utf8');
+    fs.writeFileSync(DB_FILE, JSON.stringify(registry, null, 2), 'utf8');
   } catch (e) {}
 }
 
-loadIdRegistry();
+loadRegistry();
 
-function getNextSequentialId(hostname) {
-  const hostKey = (hostname || '').trim().toUpperCase();
-  if (hostKey && idRegistry.byHost[hostKey]) {
-    return idRegistry.byHost[hostKey];
-  }
-
-  // Mevcut tüm kullanılan numaraları bul (PC-01, PC-02...)
-  const usedIds = new Set([
-    ...Object.values(idRegistry.byHost),
-    ...Array.from(clients.keys())
-  ]);
-
-  let num = 1;
-  while (true) {
-    const candidate = 'PC-' + String(num).padStart(2, '0');
-    if (!usedIds.has(candidate)) {
-      if (hostKey) {
-        idRegistry.byHost[hostKey] = candidate;
-      }
-      if (num > idRegistry.counter) idRegistry.counter = num;
-      saveIdRegistry();
-      return candidate;
-    }
-    num++;
-  }
+// Sunucu tarafından sırayla PC-01, PC-02, PC-03 üretir (Hostname aynı olsa bile her kurulum yeni sıra alır!)
+function allocateNextClientId() {
+  registry.counter += 1;
+  const assignedId = 'PC-' + String(registry.counter).padStart(2, '0');
+  const token = crypto.randomBytes(8).toString('hex');
+  registry.tokens[token] = assignedId;
+  saveRegistry();
+  return { clientId: assignedId, token };
 }
 
 const ALLOWED_ACTIONS = [
@@ -91,7 +79,7 @@ const ALLOWED_ACTIONS = [
 
 let remoteVersionCache = {
   serverVersion: SERVER_VERSION,
-  clientVersion: '1.5.0',
+  clientVersion: '1.6.0',
   commitSha: 'main',
   lastChecked: '-'
 };
@@ -199,7 +187,7 @@ async function checkGitHubVersionAndAutoUpdate() {
           const parsed = JSON.parse(data);
           remoteVersionCache = {
             serverVersion: parsed.serverVersion || SERVER_VERSION,
-            clientVersion: parsed.clientVersion || '1.5.0',
+            clientVersion: parsed.clientVersion || '1.6.0',
             commitSha: sha,
             lastChecked: new Date().toLocaleTimeString('tr-TR')
           };
@@ -254,15 +242,19 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
 
-  // 0. Auto-Sequential ID Assignment Endpoint (PC-01, PC-02, PC-03...)
-  if (req.method === 'GET' && pathname === '/api/assign-id') {
-    const hostname = url.searchParams.get('hostname') || '';
-    const assignedId = getNextSequentialId(hostname);
-    addLog('system', `Otomatik kimlik atandı: [${hostname || 'Yeni Cihaz'}] -> ${assignedId}`);
-    return jsonResponse(res, 200, { success: true, clientId: assignedId });
+  // 0. Sunucu Tarafından Sıralı Numara Atama (Her çağrıda sıradaki PC-01, PC-02, PC-03... verilir)
+  if ((req.method === 'GET' || req.method === 'POST') && pathname === '/api/assign-id') {
+    const hostname = url.searchParams.get('hostname') || 'Windows-PC';
+    const allocated = allocateNextClientId();
+    addLog('system', `Yeni sıra numarası verildi: ${allocated.clientId} (${hostname})`);
+    return jsonResponse(res, 200, {
+      success: true,
+      clientId: allocated.clientId,
+      token: allocated.token
+    });
   }
 
-  // 0.1 Admin API: Rename Client ID from Dashboard
+  // 0.1 Admin API: Rename Client ID
   if (req.method === 'POST' && pathname === '/api/clients/rename') {
     try {
       const { oldId, newId } = await parseJsonBody(req);
@@ -281,16 +273,52 @@ const server = http.createServer(async (req, res) => {
         existingClient.id = cleanNew;
         clients.set(cleanNew, existingClient);
 
-        const hostKey = (existingClient.hostname || '').trim().toUpperCase();
-        if (hostKey) {
-          idRegistry.byHost[hostKey] = cleanNew;
-          saveIdRegistry();
+        if (existingClient.token && registry.tokens[existingClient.token]) {
+          registry.tokens[existingClient.token] = cleanNew;
+          saveRegistry();
         }
       }
 
+      // Token bazlı veya eski ID bazlı güncelleme işaretle
+      for (const [tok, cId] of Object.entries(registry.tokens)) {
+        if (cId === cleanOld) {
+          registry.tokens[tok] = cleanNew;
+        }
+      }
+      saveRegistry();
       pendingRenames.set(cleanOld, cleanNew);
+
       addLog('system', `İstemci adı değiştirildi: [${cleanOld}] -> [${cleanNew}]`);
       return jsonResponse(res, 200, { success: true, oldId: cleanOld, newId: cleanNew });
+    } catch (e) {
+      return jsonResponse(res, 400, { error: e.message });
+    }
+  }
+
+  // 0.2 Admin API: Tekil İstemci Sil veya Tüm Listeyi Sıfırla
+  if (req.method === 'POST' && pathname === '/api/clients/reset') {
+    try {
+      const { clientId } = await parseJsonBody(req);
+      if (clientId && clientId !== 'all') {
+        const c = clients.get(clientId);
+        if (c && c.token) {
+          delete registry.tokens[c.token];
+        }
+        for (const [tok, idVal] of Object.entries(registry.tokens)) {
+          if (idVal === clientId) delete registry.tokens[tok];
+        }
+        clients.delete(clientId);
+        saveRegistry();
+        addLog('system', `İstemci listeden silindi: [${clientId}]`);
+      } else {
+        // Tüm listeyi ve sayacı sıfırla (PC-01'den yeniden başlar)
+        clients.clear();
+        tasks.length = 0;
+        registry = { counter: 0, tokens: {} };
+        saveRegistry();
+        addLog('system', `Tüm istemci listesi ve sıra sayacı sıfırlandı (PC-01'den başlayacak).`);
+      }
+      return jsonResponse(res, 200, { success: true });
     } catch (e) {
       return jsonResponse(res, 400, { error: e.message });
     }
@@ -301,24 +329,25 @@ const server = http.createServer(async (req, res) => {
     try {
       const data = await parseJsonBody(req);
       const serverNowMs = Date.now();
-      let clientId = data.clientId || req.socket.remoteAddress;
-      const hostKey = (data.hostname || '').trim().toUpperCase();
+      const token = (data.token || '').trim();
+      let clientId = (data.clientId || '').trim();
 
-      // Eğer istemci AUTO ile geldiyse veya sunucuda yeniden adlandırıldıysa
+      // Yalnızca geçerli bir kayıt token'ına sahip olan (sıfırlama sonrası eklenen) istemcileri kabul et!
+      if (!token || !registry.tokens[token]) {
+        return jsonResponse(res, 200, {
+          success: false,
+          unregistered: true,
+          expectedClientVersion: remoteVersionCache.clientVersion,
+          commitSha: remoteVersionCache.commitSha
+        });
+      }
+
+      // Sunucudaki güncel adını (token karşılığını) kullan
+      const serverAssignedId = registry.tokens[token];
       let assignedClientId = null;
-      if (clientId === 'AUTO' || !clientId) {
-        clientId = getNextSequentialId(hostKey);
-        assignedClientId = clientId;
-      } else if (pendingRenames.has(clientId)) {
-        assignedClientId = pendingRenames.get(clientId);
-        pendingRenames.delete(clientId);
-        clientId = assignedClientId;
-      } else if (hostKey && idRegistry.byHost[hostKey] && idRegistry.byHost[hostKey] !== clientId) {
-        assignedClientId = idRegistry.byHost[hostKey];
-        clientId = assignedClientId;
-      } else if (hostKey && !idRegistry.byHost[hostKey]) {
-        idRegistry.byHost[hostKey] = clientId;
-        saveIdRegistry();
+      if (serverAssignedId && serverAssignedId !== clientId) {
+        clientId = serverAssignedId;
+        assignedClientId = serverAssignedId;
       }
 
       const existing = clients.get(clientId);
@@ -330,11 +359,12 @@ const server = http.createServer(async (req, res) => {
 
       const clientInfo = {
         id: clientId,
+        token,
         hostname: data.hostname || 'Unknown',
         ip: data.ip || req.socket.remoteAddress,
         os: data.os || 'Windows',
         uptime: data.uptime || 'N/A',
-        version: data.version || '1.0.0',
+        version: data.version || '1.6.0',
         systemTime: data.systemTime || new Date(clientEpochMs).toLocaleTimeString('tr-TR'),
         systemDate: data.systemDate || new Date(clientEpochMs).toISOString().slice(0, 10),
         epochMs: clientEpochMs,
@@ -346,7 +376,7 @@ const server = http.createServer(async (req, res) => {
       clients.set(clientId, clientInfo);
 
       if (isNew) {
-        addLog('join', `İstemci aktif: [${clientId}] (${clientInfo.hostname} - ${clientInfo.ip})`);
+        addLog('join', `İstemci bağlandı: [${clientId}] (${clientInfo.hostname} - ${clientInfo.ip})`);
         sendTelegramNotification(`🟢 *İstemci Bağlandı:*\nID: \`${clientId}\`\nHost: ${clientInfo.hostname}\nIP: ${clientInfo.ip}\nSaat: ${clientInfo.systemTime}`);
       } else if (versionChanged) {
         addLog('system', `İstemci [${clientId}] güncellendi: v${existing.version} -> v${clientInfo.version}`);
@@ -471,6 +501,7 @@ const server = http.createServer(async (req, res) => {
 
     return jsonResponse(res, 200, {
       clients: clientList,
+      nextNumber: 'PC-' + String(registry.counter + 1).padStart(2, '0'),
       stats: {
         total: clientList.length,
         online: onlineCount,
@@ -507,7 +538,6 @@ function getDashboardHtml() {
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
-    /* shadcn/ui Zinc Dark Theme Tokens */
     :root {
       --bg: #09090b;
       --card: #0c0c0f;
@@ -564,7 +594,7 @@ function getDashboardHtml() {
     }
     .brand-text h1 { font-size: 15px; font-weight: 600; letter-spacing: -0.02em; }
     .brand-text p { font-size: 11px; color: var(--muted-fg); font-family: 'JetBrains Mono', monospace; }
-    .nav-status { display: flex; align-items: center; gap: 8px; }
+    .nav-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .badge-outline {
       display: inline-flex; align-items: center; gap: 6px;
       font-size: 11px; font-weight: 500; padding: 4px 10px;
@@ -630,6 +660,8 @@ function getDashboardHtml() {
     .btn-secondary:hover { background: #3f3f46; }
     .btn-outline { background: transparent; color: var(--fg); border-color: var(--border); }
     .btn-outline:hover { background: var(--muted); }
+    .btn-danger { background: rgba(244, 63, 94, 0.12); color: #fb7185; border-color: rgba(244, 63, 94, 0.3); }
+    .btn-danger:hover { background: var(--rose); color: #fff; }
     .btn-emerald { background: rgba(16, 185, 129, 0.12); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
     .btn-emerald:hover { background: var(--emerald); color: #09090b; }
     .btn-sm { height: 32px; padding: 0 10px; font-size: 12px; border-radius: 6px; }
@@ -734,14 +766,20 @@ function getDashboardHtml() {
         <div class="brand-icon">W</div>
         <div class="brand-text">
           <h1>WinOps Console</h1>
-          <p>v<span id="serverVer">1.5.0</span> • <span id="githubCheckInfo">OTA Aktif</span></p>
+          <p>v<span id="serverVer">1.6.0</span> • <span id="githubCheckInfo">OTA Aktif</span></p>
         </div>
       </div>
       <div class="nav-status">
         <span class="badge-outline">
+          <span>Sıradaki Kayıt: <strong id="nextNumBadge" style="color:var(--emerald);">PC-01</strong></span>
+        </span>
+        <span class="badge-outline">
           <span class="dot-live"></span>
           <span>10sn GitHub Sync</span>
         </span>
+        <button class="btn btn-danger btn-sm" onclick="resetAllClients()">
+          🗑️ Listeyi Sıfırla
+        </button>
       </div>
     </div>
   </nav>
@@ -797,12 +835,12 @@ function getDashboardHtml() {
           <div class="sh-card-header">
             <div>
               <div class="sh-card-title">İstemci Cihazlar ve Canlı Saatler</div>
-              <div class="sh-card-desc">Cihazlar otomatik PC-01, PC-02 sırasıyla kaydolur. Kalem ikonuna basarak istediğiniz zaman adını değiştirebilirsiniz.</div>
+              <div class="sh-card-desc">Her yeni kurulum sunucudan sırayla PC-01, PC-02, PC-03 numarası alır.</div>
             </div>
           </div>
           <div class="client-list" id="clientsList">
             <div style="text-align:center; color:var(--muted-fg); padding:32px; font-size:13px;">
-              İstemci bağlantısı bekleniyor...
+              Liste temiz. İlk ekleyeceğiniz bilgisayar otomatik olarak <strong>PC-01</strong> adını alacak.
             </div>
           </div>
         </div>
@@ -987,6 +1025,9 @@ function getDashboardHtml() {
         document.getElementById('statOnline').textContent = data.stats.online;
         document.getElementById('statSynced').textContent = data.stats.synced;
         document.getElementById('statOffline').textContent = data.stats.offline;
+        if (data.nextNumber) {
+          document.getElementById('nextNumBadge').textContent = data.nextNumber;
+        }
 
         if (data.remoteVersion && data.remoteVersion.lastChecked) {
           const shortSha = (data.remoteVersion.commitSha || '').slice(0, 7);
@@ -999,7 +1040,7 @@ function getDashboardHtml() {
         targetSelect.innerHTML = '<option value="all">📢 Tüm İstemciler (Broadcast)</option>';
 
         if (latestClients.length === 0) {
-          listEl.innerHTML = '<div style="text-align:center; color:var(--muted-fg); padding:32px; font-size:13px;">Henüz bağlı istemci yok.</div>';
+          listEl.innerHTML = '<div style="text-align:center; color:var(--muted-fg); padding:32px; font-size:13px;">Liste temiz. İlk ekleyeceğiniz bilgisayar otomatik olarak <strong>' + (data.nextNumber || 'PC-01') + '</strong> adını alacak.</div>';
         } else {
           listEl.innerHTML = latestClients.map(c => {
             targetSelect.innerHTML += \`<option value="\${c.id}">\${c.id} (\${c.hostname} - \${c.ip})</option>\`;
@@ -1028,6 +1069,9 @@ function getDashboardHtml() {
                         <span>\${c.id}</span>
                         <button class="btn btn-outline btn-xs" onclick="openRenameModal('\${c.id}')" title="İstemci Adını Değiştir">
                           ✏️ Adı Düzenle
+                        </button>
+                        <button class="btn btn-danger btn-xs" onclick="removeSingleClient('\${c.id}')" title="Listeden Sil">
+                          ✕
                         </button>
                         <span class="badge-outline" style="font-size:10px; padding:1px 7px;">v\${c.version || '1.0.0'}</span>
                       </div>
@@ -1106,6 +1150,28 @@ function getDashboardHtml() {
       loadDashboard();
     }
 
+    async function resetAllClients() {
+      if (!confirm('Tüm istemci listesi sıfırlansın ve sayaç PC-01 olarak baştan başlasın mı?')) return;
+      await fetch('/api/clients/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId: 'all' })
+      });
+      showToast('Liste sıfırlandı! Sıradaki cihaz PC-01 olacak.');
+      loadDashboard();
+    }
+
+    async function removeSingleClient(clientId) {
+      if (!confirm(clientId + ' listeden silinsin mi?')) return;
+      await fetch('/api/clients/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId })
+      });
+      showToast(clientId + ' listeden silindi.');
+      loadDashboard();
+    }
+
     function runSelectedTarget(action, params = {}, label = '') {
       const target = document.getElementById('targetClient').value;
       quickAction(target, action, params, label + ' (' + target + ')');
@@ -1179,7 +1245,7 @@ function getDashboardHtml() {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-  addLog('system', `WinOps shadcn/ui Konsolu başlatıldı (v${SERVER_VERSION}) - Port: ${PORT}`);
+  addLog('system', `WinOps v${SERVER_VERSION} başlatıldı (Liste sıfırlandı, sıradaki kayıt: PC-01) - Port: ${PORT}`);
   console.log(`[WinOps Server v${SERVER_VERSION}] http://0.0.0.0:${PORT} adresinde çalışıyor`);
   sendTelegramNotification(`🚀 *WinOps Yönetim Sunucusu Başlatıldı (v${SERVER_VERSION})*\nPort: ${PORT}`);
 });

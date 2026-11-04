@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.5.0)
-    Otomatik Sıralı Kimlik (PC-01, PC-02, PC-03) & Sunucudan Anlık İsim Değiştirme Desteği
+    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.6.0)
+    Sunucu Sıralı Kayıt (PC-01, PC-02, PC-03) & Token Doğrulamalı Ajan
 #>
 
 [CmdletBinding()]
@@ -10,7 +10,10 @@ param (
     [string]$ServerUrl = "http://51.195.176.183:3001",
 
     [Parameter(Mandatory = $false)]
-    [string]$ClientId = "AUTO",
+    [string]$ClientId = "",
+
+    [Parameter(Mandatory = $false)]
+    [string]$Token = "",
 
     [Parameter(Mandatory = $false)]
     [int]$PollIntervalSeconds = 3,
@@ -19,31 +22,23 @@ param (
     [string]$GitHubRepo = "ayazOne/winops"
 )
 
-$AgentVersion = "1.5.1"
-$IdFilePath = if (Test-Path "C:\WinOps\Client") { "C:\WinOps\Client\client-id.txt" } else { "$env:LOCALAPPDATA\WinOps\Client\client-id.txt" }
+$AgentVersion = "1.6.0"
+$BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif (Test-Path "C:\WinOps\Client") { "C:\WinOps\Client" } else { "$env:LOCALAPPDATA\WinOps\Client" }
+$AuthFilePath = "$BaseDir\client-auth.json"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Kalıcı istemci kimliğini oku veya sunucudan otomatik (PC-01, PC-02...) al
-if (Test-Path $IdFilePath) {
-    $savedId = (Get-Content $IdFilePath -Raw -ErrorAction SilentlyContinue).Trim()
-    if (-not [string]::IsNullOrWhiteSpace($savedId) -and $savedId -ne "AUTO") {
-        $ClientId = $savedId
-    }
+if (Test-Path $AuthFilePath) {
+    try {
+        $authObj = Get-Content $AuthFilePath -Raw | ConvertFrom-Json
+        if ($authObj.clientId) { $ClientId = $authObj.clientId }
+        if ($authObj.token) { $Token = $authObj.token }
+    } catch {}
 }
 
-if ([string]::IsNullOrWhiteSpace($ClientId) -or $ClientId -eq "AUTO") {
-    try {
-        $escapedHost = [uri]::EscapeDataString($env:COMPUTERNAME)
-        $assignResp = Invoke-RestMethod -Uri "$ServerUrl/api/assign-id?hostname=$escapedHost" -Method GET -TimeoutSec 8 -ErrorAction Stop
-        if ($assignResp.clientId) {
-            $ClientId = $assignResp.clientId
-            Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force -ErrorAction SilentlyContinue
-        }
-    } catch {
-        $ClientId = "AUTO"
-    }
-} elseif (-not (Test-Path $IdFilePath)) {
-    Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+# Eğer token yoksa (eski kurulumdan kalan ajan ise) çık, listeyi kirletme
+if ([string]::IsNullOrWhiteSpace($Token)) {
+    Stop-Process -Id $PID -Force
+    exit 0
 }
 
 function Get-LocalIPv4 {
@@ -99,11 +94,11 @@ function Invoke-AgentSelfUpdate {
                 return "Güncelleme iptal edildi: Sözdizimi hatası."
             }
 
-            $currentScriptPath = "C:\WinOps\Client\ClientAgent.ps1"
+            $currentScriptPath = "$BaseDir\ClientAgent.ps1"
             Copy-Item -Path $tempFile -Destination $currentScriptPath -Force
             Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
 
-            Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$currentScriptPath`" -ServerUrl `"$ServerUrl`" -ClientId `"$ClientId`" -GitHubRepo `"$GitHubRepo`""
+            Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$currentScriptPath`" -ServerUrl `"$ServerUrl`" -ClientId `"$ClientId`" -Token `"$Token`" -GitHubRepo `"$GitHubRepo`""
             Start-Sleep -Seconds 1
             Stop-Process -Id $PID -Force
             return "İstemci v$($remoteMeta.clientVersion) sürümüne güncellendi."
@@ -295,6 +290,7 @@ while ($true) {
 
         $heartbeatData = @{
             clientId   = $ClientId
+            token      = $Token
             hostname   = $env:COMPUTERNAME
             ip         = $cachedIp
             os         = $cachedOsCaption
@@ -308,10 +304,18 @@ while ($true) {
 
         $hbResp = Invoke-RestMethod -Uri "$ServerUrl/api/heartbeat" -Method POST -Body $heartbeatData -ContentType "application/json" -TimeoutSec 5 -ErrorAction Stop
 
-        # Sunucudan isim değiştirildiyse veya otomatik atandıysa yerel kimliği anında güncelle!
+        # Eğer sunucu listesi sıfırlandıysa veya bu cihaz listeden silindiyse çalışmayı durdur!
+        if ($hbResp.unregistered) {
+            Remove-Item $AuthFilePath -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $PID -Force
+            exit 0
+        }
+
+        # Sunucudan isim değiştirildiyse yerel kimliği güncelle
         if ($hbResp.assignedClientId -and ($hbResp.assignedClientId -ne $ClientId)) {
             $ClientId = $hbResp.assignedClientId
-            Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+            $newAuth = @{ clientId = $ClientId; token = $Token } | ConvertTo-Json
+            Set-Content -Path $AuthFilePath -Value $newAuth -Encoding UTF8 -Force -ErrorAction SilentlyContinue
         }
 
         if ($hbResp.expectedClientVersion -and ($hbResp.expectedClientVersion -ne $AgentVersion)) {
@@ -334,6 +338,7 @@ while ($true) {
             $nowAfter = Get-Date
             $postHb = @{
                 clientId   = $ClientId
+                token      = $Token
                 hostname   = $env:COMPUTERNAME
                 ip         = $cachedIp
                 os         = $cachedOsCaption
