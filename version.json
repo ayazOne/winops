@@ -1,7 +1,7 @@
 {
-  "version": "1.4.0",
-  "serverVersion": "1.4.0",
-  "clientVersion": "1.4.0",
+  "version": "1.5.0",
+  "serverVersion": "1.5.0",
+  "clientVersion": "1.5.0",
   "repo": "ayazOne/winops",
-  "releaseNotes": "shadcn/ui Zinc Dark tasarım sistemi, %100 mobil uyumlu kart mimarisi ve Hazır Sistem/CMD Araçları eklendi (v1.4.0)."
+  "releaseNotes": "Otomatik sıralı PC-01, PC-02, PC-03 kaydı ve Web Panelinden tek tıkla İstemci Adı Düzenleme eklendi (v1.5.0)."
 }

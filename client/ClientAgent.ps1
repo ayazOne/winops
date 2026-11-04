@@ -1,16 +1,16 @@
 <#
 .SYNOPSIS
-    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.4.0)
-    10-Saniyelik Zero-Cache GitHub OTA Güncelleme, Anlık Saat Kontrolü & Onaylı Sistem Araçları
+    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.5.0)
+    Otomatik Sıralı Kimlik (PC-01, PC-02, PC-03) & Sunucudan Anlık İsim Değiştirme Desteği
 #>
 
 [CmdletBinding()]
 param (
     [Parameter(Mandatory = $false)]
-    [string]$ServerUrl = "http://127.0.0.1:3001",
+    [string]$ServerUrl = "http://51.195.176.183:3001",
 
     [Parameter(Mandatory = $false)]
-    [string]$ClientId = $env:COMPUTERNAME,
+    [string]$ClientId = "AUTO",
 
     [Parameter(Mandatory = $false)]
     [int]$PollIntervalSeconds = 3,
@@ -19,8 +19,31 @@ param (
     [string]$GitHubRepo = "ayazOne/winops"
 )
 
-$AgentVersion = "1.4.0"
+$AgentVersion = "1.5.0"
+$IdFilePath = "C:\WinOps\Client\client-id.txt"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Kalıcı istemci kimliğini oku veya sunucudan otomatik (PC-01, PC-02...) al
+if (Test-Path $IdFilePath) {
+    $savedId = (Get-Content $IdFilePath -Raw).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($savedId)) {
+        $ClientId = $savedId
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($ClientId) -or $ClientId -eq "AUTO") {
+    try {
+        $assignResp = Invoke-RestMethod -Uri "$ServerUrl/api/assign-id?hostname=$([System.Web.HttpUtility]::UrlEncode($env:COMPUTERNAME))" -Method GET -TimeoutSec 8 -ErrorAction Stop
+        if ($assignResp.clientId) {
+            $ClientId = $assignResp.clientId
+            Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force
+        }
+    } catch {
+        $ClientId = "AUTO"
+    }
+} elseif (-not (Test-Path $IdFilePath)) {
+    Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+}
 
 function Get-LocalIPv4 {
     try {
@@ -54,7 +77,6 @@ function Get-LatestGitHubCommitSha {
     return "main"
 }
 
-# --- GitHub OTA Otonom Güncelleme (0sn Cache, 10sn Kontrol) ---
 function Invoke-AgentSelfUpdate {
     param (
         [string]$CommitSha = ""
@@ -92,7 +114,6 @@ function Invoke-AgentSelfUpdate {
     }
 }
 
-# --- Onaylı Saat ve Sistem Bakım Eylemleri (Güvenli Whitelist) ---
 function Invoke-MaintenanceAction {
     param (
         [string]$Action,
@@ -233,6 +254,7 @@ function Invoke-MaintenanceAction {
                 $disk = Get-PSDrive C | Select-Object @{Name="FreeGB";Expression={[math]::Round($_.Free/1GB,2)}}, @{Name="UsedGB";Expression={[math]::Round($_.Used/1GB,2)}}
 
                 $output = @"
+İstemci Adı     : $ClientId
 Ajan Sürümü     : v$AgentVersion
 Sistem Saati    : $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
 İşletim Sistemi : $os
@@ -284,6 +306,12 @@ while ($true) {
         } | ConvertTo-Json
 
         $hbResp = Invoke-RestMethod -Uri "$ServerUrl/api/heartbeat" -Method POST -Body $heartbeatData -ContentType "application/json" -TimeoutSec 5 -ErrorAction Stop
+
+        # Sunucudan isim değiştirildiyse veya otomatik atandıysa yerel kimliği anında güncelle!
+        if ($hbResp.assignedClientId -and ($hbResp.assignedClientId -ne $ClientId)) {
+            $ClientId = $hbResp.assignedClientId
+            Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+        }
 
         if ($hbResp.expectedClientVersion -and ($hbResp.expectedClientVersion -ne $AgentVersion)) {
             $null = Invoke-AgentSelfUpdate -CommitSha $hbResp.commitSha

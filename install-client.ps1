@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    WinOps İstemci Kurulum Otomasyonu (Zero-Cache 10sn Otonom Güncelleme)
+    WinOps İstemci Kurulum Otomasyonu (Otomatik Sıralı PC-01, PC-02, PC-03 Kaydı)
 #>
 
 [CmdletBinding()]
@@ -9,7 +9,7 @@ param (
     [string]$ServerUrl = "http://51.195.176.183:3001",
 
     [Parameter(Mandatory = $false)]
-    [string]$ClientId = $env:COMPUTERNAME,
+    [string]$ClientId = "AUTO",
 
     [Parameter(Mandatory = $false)]
     [string]$GitHubRepo = "ayazOne/winops"
@@ -17,6 +17,31 @@ param (
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$InstallDir = "C:\WinOps\Client"
+if (-not (Test-Path $InstallDir)) {
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+}
+
+# Sunucudan otomatik sıralı ID (PC-01, PC-02, PC-03...) al
+$IdFilePath = "$InstallDir\client-id.txt"
+if ([string]::IsNullOrWhiteSpace($ClientId) -or $ClientId -eq "AUTO") {
+    try {
+        $assignResp = Invoke-RestMethod -Uri "$ServerUrl/api/assign-id?hostname=$([System.Web.HttpUtility]::UrlEncode($env:COMPUTERNAME))" -Method GET -TimeoutSec 8 -ErrorAction Stop
+        if ($assignResp.clientId) {
+            $ClientId = $assignResp.clientId
+        }
+    } catch {
+        if (Test-Path $IdFilePath) {
+            $ClientId = (Get-Content $IdFilePath -Raw).Trim()
+        } else {
+            $ClientId = "AUTO"
+        }
+    }
+}
+if ($ClientId -and $ClientId -ne "AUTO") {
+    Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force
+}
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "  WinOps İstemci Dağıtımı ($ClientId)"      -ForegroundColor Cyan
@@ -31,11 +56,6 @@ Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'cmd.ex
     $_.CommandLine -match "ClientAgent\.ps1" -or $_.CommandLine -match "WinOps\\Client\\run\.cmd"
 } | ForEach-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-}
-
-$InstallDir = "C:\WinOps\Client"
-if (-not (Test-Path $InstallDir)) {
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
 
 # 1. En güncel Commit SHA ile GitHub CDN önbelleğini aşarak indir
@@ -72,9 +92,8 @@ Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Silent
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings | Out-Null
 Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
-# Hemen çalışmasını garantiye al
 Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$InstallDir\run.cmd`"" -WindowStyle Hidden
 
 Write-Host "[2/3] İstemci servisi kaydedildi ve başlatıldı." -ForegroundColor Cyan
-Write-Host "[3/3] Kurulum tamamlandı (v1.3.0)! 10 saniyelik otonom güncelleme aktif." -ForegroundColor Green
+Write-Host "[3/3] Kurulum tamamlandı! Atanan İstemci Adı: $ClientId" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan

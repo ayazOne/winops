@@ -1,5 +1,6 @@
 /**
- * Enterprise Windows Management Server - shadcn/ui Edition (v1.4.0)
+ * Enterprise Windows Management Server - shadcn/ui Edition (v1.5.0)
+ * Auto-Sequential Client ID (PC-01, PC-02, PC-03...) & Server-Side Rename
  * Port: 3001
  * Zero external dependencies (native http, https, fs, path, crypto)
  */
@@ -10,16 +11,70 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const SERVER_VERSION = '1.4.0';
+const SERVER_VERSION = '1.5.0';
 const PORT = process.env.PORT || 3001;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'ayazOne/winops';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
+const DB_FILE = path.join(__dirname, 'clients-db.json');
+
 // Storage
 const clients = new Map();
 const tasks = [];
 const eventLogs = [];
+const pendingRenames = new Map(); // oldId -> newId
+
+// Persistent ID Registry: { byHost: { "GE018": "PC-01" }, counter: 1 }
+let idRegistry = { byHost: {}, counter: 0 };
+
+function loadIdRegistry() {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const raw = fs.readFileSync(DB_FILE, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.byHost) {
+        idRegistry = parsed;
+      }
+    }
+  } catch (e) {}
+}
+
+function saveIdRegistry() {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(idRegistry, null, 2), 'utf8');
+  } catch (e) {}
+}
+
+loadIdRegistry();
+
+function getNextSequentialId(hostname) {
+  const hostKey = (hostname || '').trim().toUpperCase();
+  if (hostKey && idRegistry.byHost[hostKey]) {
+    return idRegistry.byHost[hostKey];
+  }
+
+  // Mevcut tüm kullanılan numaraları bul (PC-01, PC-02...)
+  const usedIds = new Set([
+    ...Object.values(idRegistry.byHost),
+    ...Array.from(clients.keys())
+  ]);
+
+  let num = 1;
+  while (true) {
+    const candidate = 'PC-' + String(num).padStart(2, '0');
+    if (!usedIds.has(candidate)) {
+      if (hostKey) {
+        idRegistry.byHost[hostKey] = candidate;
+      }
+      if (num > idRegistry.counter) idRegistry.counter = num;
+      saveIdRegistry();
+      return candidate;
+    }
+    num++;
+  }
+}
+
 const ALLOWED_ACTIONS = [
   'sync-ntp',
   'sync-server-time',
@@ -36,7 +91,7 @@ const ALLOWED_ACTIONS = [
 
 let remoteVersionCache = {
   serverVersion: SERVER_VERSION,
-  clientVersion: '1.4.0',
+  clientVersion: '1.5.0',
   commitSha: 'main',
   lastChecked: '-'
 };
@@ -144,7 +199,7 @@ async function checkGitHubVersionAndAutoUpdate() {
           const parsed = JSON.parse(data);
           remoteVersionCache = {
             serverVersion: parsed.serverVersion || SERVER_VERSION,
-            clientVersion: parsed.clientVersion || '1.4.0',
+            clientVersion: parsed.clientVersion || '1.5.0',
             commitSha: sha,
             lastChecked: new Date().toLocaleTimeString('tr-TR')
           };
@@ -199,12 +254,73 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
 
+  // 0. Auto-Sequential ID Assignment Endpoint (PC-01, PC-02, PC-03...)
+  if (req.method === 'GET' && pathname === '/api/assign-id') {
+    const hostname = url.searchParams.get('hostname') || '';
+    const assignedId = getNextSequentialId(hostname);
+    addLog('system', `Otomatik kimlik atandı: [${hostname || 'Yeni Cihaz'}] -> ${assignedId}`);
+    return jsonResponse(res, 200, { success: true, clientId: assignedId });
+  }
+
+  // 0.1 Admin API: Rename Client ID from Dashboard
+  if (req.method === 'POST' && pathname === '/api/clients/rename') {
+    try {
+      const { oldId, newId } = await parseJsonBody(req);
+      const cleanOld = (oldId || '').trim();
+      const cleanNew = (newId || '').trim();
+      if (!cleanOld || !cleanNew) {
+        return jsonResponse(res, 400, { error: 'Geçersiz isim.' });
+      }
+      if (cleanOld === cleanNew) {
+        return jsonResponse(res, 200, { success: true });
+      }
+
+      const existingClient = clients.get(cleanOld);
+      if (existingClient) {
+        clients.delete(cleanOld);
+        existingClient.id = cleanNew;
+        clients.set(cleanNew, existingClient);
+
+        const hostKey = (existingClient.hostname || '').trim().toUpperCase();
+        if (hostKey) {
+          idRegistry.byHost[hostKey] = cleanNew;
+          saveIdRegistry();
+        }
+      }
+
+      pendingRenames.set(cleanOld, cleanNew);
+      addLog('system', `İstemci adı değiştirildi: [${cleanOld}] -> [${cleanNew}]`);
+      return jsonResponse(res, 200, { success: true, oldId: cleanOld, newId: cleanNew });
+    } catch (e) {
+      return jsonResponse(res, 400, { error: e.message });
+    }
+  }
+
   // 1. Client Heartbeat
   if (req.method === 'POST' && pathname === '/api/heartbeat') {
     try {
       const data = await parseJsonBody(req);
       const serverNowMs = Date.now();
-      const clientId = data.clientId || req.socket.remoteAddress;
+      let clientId = data.clientId || req.socket.remoteAddress;
+      const hostKey = (data.hostname || '').trim().toUpperCase();
+
+      // Eğer istemci AUTO ile geldiyse veya sunucuda yeniden adlandırıldıysa
+      let assignedClientId = null;
+      if (clientId === 'AUTO' || !clientId) {
+        clientId = getNextSequentialId(hostKey);
+        assignedClientId = clientId;
+      } else if (pendingRenames.has(clientId)) {
+        assignedClientId = pendingRenames.get(clientId);
+        pendingRenames.delete(clientId);
+        clientId = assignedClientId;
+      } else if (hostKey && idRegistry.byHost[hostKey] && idRegistry.byHost[hostKey] !== clientId) {
+        assignedClientId = idRegistry.byHost[hostKey];
+        clientId = assignedClientId;
+      } else if (hostKey && !idRegistry.byHost[hostKey]) {
+        idRegistry.byHost[hostKey] = clientId;
+        saveIdRegistry();
+      }
+
       const existing = clients.get(clientId);
       const isNew = !existing;
       const versionChanged = existing && existing.version !== data.version;
@@ -230,8 +346,8 @@ const server = http.createServer(async (req, res) => {
       clients.set(clientId, clientInfo);
 
       if (isNew) {
-        addLog('join', `Yeni istemci bağlandı: [${clientId}] (${clientInfo.ip}) - Saat: ${clientInfo.systemTime}`);
-        sendTelegramNotification(`🟢 *Yeni İstemci Bağlandı:*\nID: \`${clientId}\`\nHost: ${clientInfo.hostname}\nIP: ${clientInfo.ip}\nSaat: ${clientInfo.systemTime}\nVersiyon: v${clientInfo.version}`);
+        addLog('join', `İstemci aktif: [${clientId}] (${clientInfo.hostname} - ${clientInfo.ip})`);
+        sendTelegramNotification(`🟢 *İstemci Bağlandı:*\nID: \`${clientId}\`\nHost: ${clientInfo.hostname}\nIP: ${clientInfo.ip}\nSaat: ${clientInfo.systemTime}`);
       } else if (versionChanged) {
         addLog('system', `İstemci [${clientId}] güncellendi: v${existing.version} -> v${clientInfo.version}`);
       }
@@ -239,6 +355,7 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(res, 200, {
         success: true,
         registered: true,
+        assignedClientId,
         serverEpochMs: Date.now(),
         expectedClientVersion: remoteVersionCache.clientVersion,
         commitSha: remoteVersionCache.commitSha
@@ -333,22 +450,24 @@ const server = http.createServer(async (req, res) => {
     let onlineCount = 0;
     let syncedCount = 0;
 
-    const clientList = Array.from(clients.values()).map(c => {
-      const diffSeconds = Math.floor((now - new Date(c.lastSeen).getTime()) / 1000);
-      const isOnline = diffSeconds < 20;
-      if (isOnline) onlineCount++;
-      const absDrift = Math.abs(c.driftSeconds || 0);
-      if (isOnline && absDrift <= 3) syncedCount++;
+    const clientList = Array.from(clients.values())
+      .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }))
+      .map(c => {
+        const diffSeconds = Math.floor((now - new Date(c.lastSeen).getTime()) / 1000);
+        const isOnline = diffSeconds < 20;
+        if (isOnline) onlineCount++;
+        const absDrift = Math.abs(c.driftSeconds || 0);
+        if (isOnline && absDrift <= 3) syncedCount++;
 
-      const estimatedClientMs = (c.epochMs || now) + (now - new Date(c.lastSeen).getTime());
+        const estimatedClientMs = (c.epochMs || now) + (now - new Date(c.lastSeen).getTime());
 
-      return {
-        ...c,
-        isOnline,
-        diffSeconds,
-        estimatedClientMs
-      };
-    });
+        return {
+          ...c,
+          isOnline,
+          diffSeconds,
+          estimatedClientMs
+        };
+      });
 
     return jsonResponse(res, 200, {
       clients: clientList,
@@ -418,7 +537,6 @@ function getDashboardHtml() {
       -webkit-font-smoothing: antialiased;
     }
 
-    /* Top Navbar */
     .navbar {
       position: sticky;
       top: 0;
@@ -437,60 +555,25 @@ function getDashboardHtml() {
       gap: 12px;
       flex-wrap: wrap;
     }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
+    .brand { display: flex; align-items: center; gap: 10px; }
     .brand-icon {
-      width: 34px;
-      height: 34px;
-      border-radius: 8px;
-      background: var(--fg);
-      color: var(--bg);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 700;
-      flex-shrink: 0;
+      width: 34px; height: 34px; border-radius: 8px;
+      background: var(--fg); color: var(--bg);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; flex-shrink: 0;
     }
-    .brand-text h1 {
-      font-size: 15px;
-      font-weight: 600;
-      letter-spacing: -0.02em;
-    }
-    .brand-text p {
-      font-size: 11px;
-      color: var(--muted-fg);
-      font-family: 'JetBrains Mono', monospace;
-    }
-    .nav-status {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
+    .brand-text h1 { font-size: 15px; font-weight: 600; letter-spacing: -0.02em; }
+    .brand-text p { font-size: 11px; color: var(--muted-fg); font-family: 'JetBrains Mono', monospace; }
+    .nav-status { display: flex; align-items: center; gap: 8px; }
     .badge-outline {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 11px;
-      font-weight: 500;
-      padding: 4px 10px;
-      border-radius: 9999px;
-      border: 1px solid var(--border);
-      background: var(--muted);
-      color: var(--fg);
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 11px; font-weight: 500; padding: 4px 10px;
+      border-radius: 9999px; border: 1px solid var(--border);
+      background: var(--muted); color: var(--fg);
       font-family: 'JetBrains Mono', monospace;
     }
-    .dot-live {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--emerald);
-      box-shadow: 0 0 8px var(--emerald);
-    }
+    .dot-live { width: 6px; height: 6px; border-radius: 50%; background: var(--emerald); box-shadow: 0 0 8px var(--emerald); }
 
-    /* Container */
     .container {
       max-width: 1440px;
       margin: 0 auto;
@@ -500,7 +583,6 @@ function getDashboardHtml() {
       gap: 20px;
     }
 
-    /* shadcn Card */
     .sh-card {
       background: var(--card);
       border: 1px solid var(--border);
@@ -516,341 +598,119 @@ function getDashboardHtml() {
       gap: 12px;
       flex-wrap: wrap;
     }
-    .sh-card-title {
-      font-size: 14px;
-      font-weight: 600;
-      letter-spacing: -0.01em;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .sh-card-desc {
-      font-size: 12px;
-      color: var(--muted-fg);
-    }
-    .sh-card-body {
-      padding: 20px;
-    }
+    .sh-card-title { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; display: flex; align-items: center; gap: 8px; }
+    .sh-card-desc { font-size: 12px; color: var(--muted-fg); }
+    .sh-card-body { padding: 20px; }
 
-    /* Hero Server Clock Banner */
     .hero-banner {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 16px;
-      padding: 20px 24px;
+      display: flex; align-items: center; justify-content: space-between;
+      flex-wrap: wrap; gap: 16px; padding: 20px 24px;
       background: linear-gradient(180deg, #121215 0%, #09090b 100%);
     }
-    .hero-clock-group {
-      display: flex;
-      align-items: baseline;
-      gap: 16px;
-      flex-wrap: wrap;
-    }
+    .hero-clock-group { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
     .hero-clock {
       font-family: 'JetBrains Mono', monospace;
-      font-size: 36px;
-      font-weight: 700;
-      letter-spacing: -0.03em;
-      color: var(--fg);
-      line-height: 1;
+      font-size: 36px; font-weight: 700; letter-spacing: -0.03em;
+      color: var(--fg); line-height: 1;
     }
-    .hero-date {
-      font-size: 13px;
-      color: var(--muted-fg);
-    }
-    .hero-btn-group {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
+    .hero-date { font-size: 13px; color: var(--muted-fg); }
+    .hero-btn-group { display: flex; flex-wrap: wrap; gap: 8px; }
 
-    /* shadcn Buttons */
     .btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      font-family: inherit;
-      font-size: 13px;
-      font-weight: 500;
-      height: 36px;
-      padding: 0 14px;
-      border-radius: 8px;
-      cursor: pointer;
-      transition: all 0.15s ease;
-      border: 1px solid transparent;
-      white-space: nowrap;
-      text-decoration: none;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      font-family: inherit; font-size: 13px; font-weight: 500;
+      height: 36px; padding: 0 14px; border-radius: 8px;
+      cursor: pointer; transition: all 0.15s ease;
+      border: 1px solid transparent; white-space: nowrap; text-decoration: none;
     }
     .btn:active { transform: scale(0.98); }
-    .btn-primary {
-      background: var(--primary);
-      color: var(--primary-fg);
-    }
+    .btn-primary { background: var(--primary); color: var(--primary-fg); }
     .btn-primary:hover { opacity: 0.9; }
-    .btn-secondary {
-      background: var(--secondary);
-      color: var(--secondary-fg);
-      border-color: #3f3f46;
-    }
+    .btn-secondary { background: var(--secondary); color: var(--secondary-fg); border-color: #3f3f46; }
     .btn-secondary:hover { background: #3f3f46; }
-    .btn-outline {
-      background: transparent;
-      color: var(--fg);
-      border-color: var(--border);
-    }
+    .btn-outline { background: transparent; color: var(--fg); border-color: var(--border); }
     .btn-outline:hover { background: var(--muted); }
-    .btn-emerald {
-      background: rgba(16, 185, 129, 0.12);
-      color: #34d399;
-      border-color: rgba(16, 185, 129, 0.3);
-    }
-    .btn-emerald:hover {
-      background: var(--emerald);
-      color: #09090b;
-    }
-    .btn-sm {
-      height: 32px;
-      padding: 0 10px;
-      font-size: 12px;
-      border-radius: 6px;
-    }
+    .btn-emerald { background: rgba(16, 185, 129, 0.12); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+    .btn-emerald:hover { background: var(--emerald); color: #09090b; }
+    .btn-sm { height: 32px; padding: 0 10px; font-size: 12px; border-radius: 6px; }
+    .btn-xs { height: 24px; padding: 0 8px; font-size: 11px; border-radius: 5px; }
 
-    /* KPI Metrics Grid */
-    .kpi-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 14px;
-    }
-    .kpi-card {
-      padding: 16px 18px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .kpi-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      font-size: 12px;
-      color: var(--muted-fg);
-      font-weight: 500;
-    }
-    .kpi-val {
-      font-size: 26px;
-      font-weight: 700;
-      font-family: 'JetBrains Mono', monospace;
-      letter-spacing: -0.02em;
-    }
+    .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+    .kpi-card { padding: 16px 18px; display: flex; flex-direction: column; gap: 6px; }
+    .kpi-top { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--muted-fg); font-weight: 500; }
+    .kpi-val { font-size: 26px; font-weight: 700; font-family: 'JetBrains Mono', monospace; letter-spacing: -0.02em; }
 
-    /* Main Workspace Grid */
-    .workspace-grid {
-      display: grid;
-      grid-template-columns: 1.85fr 1fr;
-      gap: 20px;
-      align-items: start;
-    }
+    .workspace-grid { display: grid; grid-template-columns: 1.85fr 1fr; gap: 20px; align-items: start; }
 
-    /* Client Cards List (Mobile & Desktop Friendly) */
-    .client-list {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      padding: 16px;
-    }
+    .client-list { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
     .client-item {
-      border: 1px solid var(--border);
-      background: #0f0f13;
-      border-radius: 10px;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
+      border: 1px solid var(--border); background: #0f0f13;
+      border-radius: 10px; padding: 16px;
+      display: flex; flex-direction: column; gap: 14px;
       transition: border-color 0.15s;
     }
-    .client-item:hover {
-      border-color: #3f3f46;
-    }
-    .client-row-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .client-identity {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .status-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
+    .client-item:hover { border-color: #3f3f46; }
+    .client-row-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .client-identity { display: flex; align-items: center; gap: 10px; }
+    .status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
     .status-online { background: var(--emerald); box-shadow: 0 0 10px rgba(16, 185, 129, 0.6); }
     .status-offline { background: var(--rose); }
-    .client-name {
-      font-size: 15px;
-      font-weight: 600;
-      color: var(--fg);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .client-meta {
-      font-size: 12px;
-      color: var(--muted-fg);
-      font-family: 'JetBrains Mono', monospace;
-    }
+    .client-name { font-size: 15px; font-weight: 600; color: var(--fg); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .client-meta { font-size: 12px; color: var(--muted-fg); font-family: 'JetBrains Mono', monospace; }
 
-    /* Client Clock Box */
     .client-clock-panel {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px 16px;
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; flex-wrap: wrap; background: var(--bg);
+      border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px;
     }
-    .client-digital {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 24px;
-      font-weight: 700;
-      color: var(--fg);
-      letter-spacing: -0.02em;
-    }
-    .drift-pill {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
-      font-weight: 600;
-      padding: 4px 10px;
-      border-radius: 9999px;
-    }
+    .client-digital { font-family: 'JetBrains Mono', monospace; font-size: 24px; font-weight: 700; color: var(--fg); letter-spacing: -0.02em; }
+    .drift-pill { font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 600; padding: 4px 10px; border-radius: 9999px; }
     .drift-ok { background: rgba(16, 185, 129, 0.12); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.25); }
     .drift-warn { background: rgba(245, 158, 11, 0.12); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.25); }
     .drift-bad { background: rgba(244, 63, 94, 0.15); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.3); }
 
-    /* Client Action Toolbar */
-    .client-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
+    .client-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
-    /* Form Elements (shadcn Input & Select) */
-    .form-group {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      margin-bottom: 14px;
-    }
-    .form-label {
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--fg);
-    }
+    .form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+    .form-label { font-size: 12px; font-weight: 500; color: var(--fg); }
     .sh-select, .sh-input {
-      width: 100%;
-      height: 38px;
-      padding: 0 12px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: var(--bg);
-      color: var(--fg);
-      font-family: inherit;
-      font-size: 13px;
-      outline: none;
-      transition: border-color 0.15s;
+      width: 100%; height: 38px; padding: 0 12px; border-radius: 8px;
+      border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+      font-family: inherit; font-size: 13px; outline: none; transition: border-color 0.15s;
     }
-    .sh-select:focus, .sh-input:focus {
-      border-color: #71717a;
-    }
+    .sh-select:focus, .sh-input:focus { border-color: #71717a; }
 
-    /* Preset Command Grid */
-    .cmd-preset-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 8px;
-      margin-top: 8px;
-    }
+    .cmd-preset-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 8px; }
 
-    /* Terminal Output & Logs */
     .terminal-box {
-      background: #050507;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11.5px;
-      color: #d4d4d8;
-      max-height: 220px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      line-height: 1.5;
+      background: #050507; border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
+      color: #d4d4d8; max-height: 220px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5;
     }
 
-    /* Toast Notification */
     .toast-wrap {
-      position: fixed;
-      bottom: 20px;
-      right: 20px;
-      z-index: 100;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      pointer-events: none;
+      position: fixed; bottom: 20px; right: 20px; z-index: 100;
+      display: flex; flex-direction: column; gap: 8px; pointer-events: none;
     }
     .toast {
-      background: var(--fg);
-      color: var(--bg);
-      padding: 10px 16px;
-      border-radius: 8px;
-      font-size: 13px;
-      font-weight: 500;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-      animation: slideIn 0.2s ease;
+      background: var(--fg); color: var(--bg); padding: 10px 16px;
+      border-radius: 8px; font-size: 13px; font-weight: 500;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5); animation: slideIn 0.2s ease;
     }
-    @keyframes slideIn {
-      from { transform: translateY(12px); opacity: 0; }
-      to { transform: translateY(0); opacity: 1; }
-    }
+    @keyframes slideIn { from { transform: translateY(12px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
-    /* Modal Dialog */
     .modal-overlay {
-      position: fixed;
-      inset: 0;
-      background: rgba(0, 0, 0, 0.8);
-      backdrop-filter: blur(4px);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      z-index: 90;
-      padding: 16px;
+      position: fixed; inset: 0; background: rgba(0, 0, 0, 0.8);
+      backdrop-filter: blur(4px); display: none; align-items: center;
+      justify-content: center; z-index: 90; padding: 16px;
     }
     .modal-dialog {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      width: 100%;
-      max-width: 420px;
-      padding: 20px;
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; width: 100%; max-width: 420px; padding: 20px;
       box-shadow: 0 20px 40px rgba(0,0,0,0.6);
     }
-    .offset-btns {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 8px;
-      margin: 10px 0 16px;
-    }
+    .offset-btns { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 10px 0 16px; }
 
-    /* Mobile Responsive Breakpoints */
     @media (max-width: 1024px) {
       .workspace-grid { grid-template-columns: 1fr; }
     }
@@ -868,14 +728,13 @@ function getDashboardHtml() {
 </head>
 <body>
 
-  <!-- Top Navbar -->
   <nav class="navbar">
     <div class="navbar-inner">
       <div class="brand">
         <div class="brand-icon">W</div>
         <div class="brand-text">
           <h1>WinOps Console</h1>
-          <p>v<span id="serverVer">1.4.0</span> • <span id="githubCheckInfo">OTA Aktif</span></p>
+          <p>v<span id="serverVer">1.5.0</span> • <span id="githubCheckInfo">OTA Aktif</span></p>
         </div>
       </div>
       <div class="nav-status">
@@ -887,10 +746,8 @@ function getDashboardHtml() {
     </div>
   </nav>
 
-  <!-- Main Content -->
   <main class="container">
 
-    <!-- Server Reference Clock & Quick Broadcast -->
     <section class="sh-card hero-banner">
       <div>
         <div style="font-size:11px; color:var(--muted-fg); text-transform:uppercase; font-weight:600; letter-spacing:0.05em; margin-bottom:4px;">
@@ -914,7 +771,6 @@ function getDashboardHtml() {
       </div>
     </section>
 
-    <!-- KPI Cards -->
     <section class="kpi-grid">
       <div class="sh-card kpi-card">
         <div class="kpi-top"><span>Toplam Cihaz</span><span>💻</span></div>
@@ -934,16 +790,14 @@ function getDashboardHtml() {
       </div>
     </section>
 
-    <!-- Workspace Grid -->
     <div class="workspace-grid">
 
-      <!-- Left Column: Connected Clients & Live Clocks -->
       <div style="display:flex; flex-direction:column; gap:20px;">
         <div class="sh-card">
           <div class="sh-card-header">
             <div>
               <div class="sh-card-title">İstemci Cihazlar ve Canlı Saatler</div>
-              <div class="sh-card-desc">Her istemcinin saati 3 saniyede bir gerçek zamanlı senkronize edilir.</div>
+              <div class="sh-card-desc">Cihazlar otomatik PC-01, PC-02 sırasıyla kaydolur. Kalem ikonuna basarak istediğiniz zaman adını değiştirebilirsiniz.</div>
             </div>
           </div>
           <div class="client-list" id="clientsList">
@@ -953,7 +807,6 @@ function getDashboardHtml() {
           </div>
         </div>
 
-        <!-- Live Logs Card -->
         <div class="sh-card">
           <div class="sh-card-header">
             <div class="sh-card-title">Canlı Sistem Akışı (Event Log)</div>
@@ -964,10 +817,8 @@ function getDashboardHtml() {
         </div>
       </div>
 
-      <!-- Right Column: System & CMD Tools + Task Outputs -->
       <div style="display:flex; flex-direction:column; gap:20px;">
 
-        <!-- CMD & System Maintenance Toolkit -->
         <div class="sh-card">
           <div class="sh-card-header">
             <div>
@@ -983,7 +834,7 @@ function getDashboardHtml() {
               </select>
             </div>
 
-            <label class="form-label">Hazır CMD & Bakım Komutları (Tek Tıkla Çalıştır)</label>
+            <label class="form-label">Hazır CMD & Bakım Komutları</label>
             <div class="cmd-preset-grid">
               <button class="btn btn-secondary btn-sm" onclick="runSelectedTarget('sys-info', {}, 'Donanım raporu istendi')">
                 📊 Sistem & RAM Raporu
@@ -1015,7 +866,6 @@ function getDashboardHtml() {
           </div>
         </div>
 
-        <!-- Recent Command Outputs -->
         <div class="sh-card">
           <div class="sh-card-header">
             <div>
@@ -1059,7 +909,24 @@ function getDashboardHtml() {
     </div>
   </div>
 
-  <!-- Toast Container -->
+  <!-- Modal: Rename Client ID -->
+  <div class="modal-overlay" id="renameModal">
+    <div class="modal-dialog">
+      <h3 style="font-size:16px; font-weight:600; margin-bottom:4px;">İstemci Adını Düzenle</h3>
+      <p style="font-size:12px; color:var(--muted-fg); margin-bottom:16px;">Cihazın listedeki adını değiştirin (Örn: PC-02, MUHASEBE-01). İstemci otomatik güncellenir.</p>
+
+      <div class="form-group">
+        <label class="form-label">Yeni İstemci Adı (ID)</label>
+        <input type="text" class="sh-input" id="renameInput" placeholder="Örn: PC-02">
+      </div>
+
+      <div style="display:flex; gap:8px;">
+        <button class="btn btn-outline" style="flex:1;" onclick="closeRenameModal()">Vazgeç</button>
+        <button class="btn btn-primary" style="flex:1;" onclick="submitRenameClient()">Kaydet</button>
+      </div>
+    </div>
+  </div>
+
   <div class="toast-wrap" id="toastWrap"></div>
 
   <script>
@@ -1068,6 +935,7 @@ function getDashboardHtml() {
     let latestClients = [];
     let lastFetchLocalMs = Date.now();
     let modalTargetClient = 'all';
+    let renameOldId = '';
 
     function showToast(msg) {
       const wrap = document.getElementById('toastWrap');
@@ -1158,6 +1026,9 @@ function getDashboardHtml() {
                     <div>
                       <div class="client-name">
                         <span>\${c.id}</span>
+                        <button class="btn btn-outline btn-xs" onclick="openRenameModal('\${c.id}')" title="İstemci Adını Değiştir">
+                          ✏️ Adı Düzenle
+                        </button>
                         <span class="badge-outline" style="font-size:10px; padding:1px 7px;">v\${c.version || '1.0.0'}</span>
                       </div>
                       <div class="client-meta">\${c.hostname} • \${c.ip} • \${c.diffSeconds}sn önce</div>
@@ -1256,6 +1127,35 @@ function getDashboardHtml() {
 
     function closeTimeModal() {
       document.getElementById('timeModal').style.display = 'none';
+    }
+
+    function openRenameModal(oldId) {
+      renameOldId = oldId;
+      document.getElementById('renameInput').value = oldId;
+      document.getElementById('renameModal').style.display = 'flex';
+      setTimeout(() => document.getElementById('renameInput').focus(), 50);
+    }
+
+    function closeRenameModal() {
+      document.getElementById('renameModal').style.display = 'none';
+    }
+
+    async function submitRenameClient() {
+      const newId = document.getElementById('renameInput').value.trim();
+      if (!newId) return;
+      const res = await fetch('/api/clients/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ oldId: renameOldId, newId })
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast(renameOldId + ' -> ' + newId + ' olarak değiştirildi');
+        closeRenameModal();
+        loadDashboard();
+      } else {
+        alert(data.error || 'Hata oluştu');
+      }
     }
 
     async function applyCustomTimeString() {
