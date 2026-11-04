@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    WinOps Sunucu Kurulum Otomasyonu (Port 3001 - Zero-Cache 10sn Otonom Güncelleme)
+    WinOps Sunucu Kurulum Otomasyonu (Port 3001 - Portable Node.js Destekli & 10sn Otonom Güncelleme)
 #>
 
 [CmdletBinding()]
@@ -25,7 +25,12 @@ Write-Host "==========================================" -ForegroundColor Green
 Write-Host "  WinOps Sunucu Kuruluyor (Port: $Port)"    -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Green
 
-# 1. Yalnızca eski WinOps süreçlerini kapat (Diğer Node.js servislerine / Port 3000'e dokunmaz!)
+$InstallDir = "C:\WinOps\Server"
+if (-not (Test-Path $InstallDir)) {
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+}
+
+# 1. Yalnızca eski WinOps süreçlerini kapat
 $TaskName = "WinOpsServerService"
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
@@ -36,21 +41,16 @@ Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe' OR Name = 'node.exe'" -E
 }
 Start-Sleep -Seconds 1
 
-# 2. Node.js Kontrolü ve Tam Yolu
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    Write-Warning "Node.js sistemde bulunamadı. Winget ile kuruluyor..."
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        winget install OpenJS.NodeJS -e --silent --accept-package-agreements --accept-source-agreements
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-    } else {
-        throw "Lütfen Node.js kurun: https://nodejs.org"
-    }
-}
-$nodeExe = (Get-Command node).Source
-
-$InstallDir = "C:\WinOps\Server"
-if (-not (Test-Path $InstallDir)) {
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+# 2. Node.js Kontrolü (Yoksa doğrudan resmi portable node.exe indirir, Winget bile gerekmez!)
+$nodeExe = $null
+if (Get-Command node -ErrorAction SilentlyContinue) {
+    $nodeExe = (Get-Command node).Source
+} elseif (Test-Path "$InstallDir\node.exe") {
+    $nodeExe = "$InstallDir\node.exe"
+} else {
+    Write-Host "[!] Node.js bulunamadı. Resmi portable node.exe doğrudan indiriliyor..." -ForegroundColor Yellow
+    Invoke-RestMethod -Uri "https://nodejs.org/dist/v20.18.0/win-x64/node.exe" -OutFile "$InstallDir\node.exe"
+    $nodeExe = "$InstallDir\node.exe"
 }
 
 # 3. GitHub CDN önbelleğini aşmak için en son Commit SHA'yı al (0sn gecikme)
