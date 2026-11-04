@@ -43,7 +43,7 @@ if (-not (Test-Path $InstallDir)) {
 
 # 2. server.js dosyasını GitHub'dan indir
 $rawServerUrl = "https://raw.githubusercontent.com/$GitHubRepo/main/server/server.js?t=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
-Write-Host "[1/3] Sunucu dosyaları GitHub'dan indiriliyor..." -ForegroundColor Cyan
+Write-Host "[1/4] Sunucu dosyaları GitHub'dan indiriliyor..." -ForegroundColor Cyan
 Invoke-RestMethod -Uri $rawServerUrl -OutFile "$InstallDir\server.js"
 
 # 3. Başlatma Betiği
@@ -57,7 +57,25 @@ node "$InstallDir\server.js"
 "@
 Set-Content -Path "$InstallDir\start.bat" -Value $envScript -Encoding UTF8
 
-# 4. Windows Görevini Ayarla (Açılışta çalışması için)
+# 4. Masaüstü Kısayolu / Uygulama Modu Başlatıcı (Edge App Mode)
+$launcherCmd = @"
+@echo off
+where msedge.exe >nul 2>&1
+if %errorlevel% equ 0 (
+    start msedge.exe --app=http://localhost:$Port
+) else (
+    start http://localhost:$Port
+)
+"@
+Set-Content -Path "$InstallDir\Open-Dashboard.cmd" -Value $launcherCmd -Encoding ASCII
+
+# Masaüstüne kısayol koy
+$desktopPath = [Environment]::GetFolderPath("Desktop")
+if ($desktopPath -and (Test-Path $desktopPath)) {
+    Copy-Item -Path "$InstallDir\Open-Dashboard.cmd" -Destination "$desktopPath\WinOps Takip Konsolu.cmd" -Force
+}
+
+# 5. Windows Görevini Ayarla (Açılışta çalışması için)
 $TaskName = "WinOpsServerService"
 $Action = New-ScheduledTaskAction -Execute "$InstallDir\start.bat"
 $Trigger = New-ScheduledTaskTrigger -AtStartup
@@ -67,9 +85,10 @@ Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Silent
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal | Out-Null
 Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
-Write-Host "[2/3] Güvenlik duvarı kuralı ekleniyor (Port $Port)..." -ForegroundColor Cyan
+Write-Host "[2/4] Güvenlik duvarı kuralı ekleniyor (Port $Port)..." -ForegroundColor Cyan
 New-NetFirewallRule -DisplayName "WinOps Server $Port" -Direction Inbound -LocalPort $Port -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
 
-Write-Host "[3/3] Sunucu başarıyla kuruldu ve başlatıldı!" -ForegroundColor Green
+Write-Host "[3/4] Masaüstüne 'WinOps Takip Konsolu' kısayolu eklendi!" -ForegroundColor Cyan
+Write-Host "[4/4] Sunucu başarıyla kuruldu ve başlatıldı!" -ForegroundColor Green
 Write-Host "Panel: http://localhost:$Port" -ForegroundColor Yellow
 Write-Host "==========================================" -ForegroundColor Green

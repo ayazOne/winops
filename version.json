@@ -1,7 +1,7 @@
 {
-  "version": "1.0.0",
-  "serverVersion": "1.0.0",
+  "version": "1.0.1",
+  "serverVersion": "1.0.1",
   "clientVersion": "1.0.0",
   "repo": "ayazOne/winops",
-  "releaseNotes": "İlk kararlı sürüm: Merkezi yönetim, NTP senkronizasyonu, OTA otomatik güncelleme."
+  "releaseNotes": "NOC Canlı Takip Konsolu, İstemci bazında hızlı bakım butonları ve Canlı Hareket Akışı (Live Ticker) eklendi."
 }
