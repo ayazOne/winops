@@ -19,24 +19,25 @@ param (
     [string]$GitHubRepo = "ayazOne/winops"
 )
 
-$AgentVersion = "1.5.0"
-$IdFilePath = "C:\WinOps\Client\client-id.txt"
+$AgentVersion = "1.5.1"
+$IdFilePath = if (Test-Path "C:\WinOps\Client") { "C:\WinOps\Client\client-id.txt" } else { "$env:LOCALAPPDATA\WinOps\Client\client-id.txt" }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Kalıcı istemci kimliğini oku veya sunucudan otomatik (PC-01, PC-02...) al
 if (Test-Path $IdFilePath) {
-    $savedId = (Get-Content $IdFilePath -Raw).Trim()
-    if (-not [string]::IsNullOrWhiteSpace($savedId)) {
+    $savedId = (Get-Content $IdFilePath -Raw -ErrorAction SilentlyContinue).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($savedId) -and $savedId -ne "AUTO") {
         $ClientId = $savedId
     }
 }
 
 if ([string]::IsNullOrWhiteSpace($ClientId) -or $ClientId -eq "AUTO") {
     try {
-        $assignResp = Invoke-RestMethod -Uri "$ServerUrl/api/assign-id?hostname=$([System.Web.HttpUtility]::UrlEncode($env:COMPUTERNAME))" -Method GET -TimeoutSec 8 -ErrorAction Stop
+        $escapedHost = [uri]::EscapeDataString($env:COMPUTERNAME)
+        $assignResp = Invoke-RestMethod -Uri "$ServerUrl/api/assign-id?hostname=$escapedHost" -Method GET -TimeoutSec 8 -ErrorAction Stop
         if ($assignResp.clientId) {
             $ClientId = $assignResp.clientId
-            Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force
+            Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force -ErrorAction SilentlyContinue
         }
     } catch {
         $ClientId = "AUTO"
@@ -317,7 +318,7 @@ while ($true) {
             $null = Invoke-AgentSelfUpdate -CommitSha $hbResp.commitSha
         }
 
-        $pollUri = "$ServerUrl/api/tasks/poll?clientId=$([System.Web.HttpUtility]::UrlEncode($ClientId))"
+        $pollUri = "$ServerUrl/api/tasks/poll?clientId=$([uri]::EscapeDataString($ClientId))"
         $pollResp = Invoke-RestMethod -Uri $pollUri -Method GET -TimeoutSec 5 -ErrorAction Stop
 
         if ($pollResp.hasTask -and $pollResp.task) {

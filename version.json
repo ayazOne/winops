@@ -1,7 +1,7 @@
 {
-  "version": "1.5.0",
+  "version": "1.5.1",
   "serverVersion": "1.5.0",
-  "clientVersion": "1.5.0",
+  "clientVersion": "1.5.1",
   "repo": "ayazOne/winops",
-  "releaseNotes": "Otomatik sıralı PC-01, PC-02, PC-03 kaydı ve Web Panelinden tek tıkla İstemci Adı Düzenleme eklendi (v1.5.0)."
+  "releaseNotes": "Standart kullanıcı (Admin olmayan CMD) desteği, Access Denied hatası çözümü ve PS 5.1 URI uyumluluğu (v1.5.1)."
 }

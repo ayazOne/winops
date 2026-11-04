@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    WinOps İstemci Kurulum Otomasyonu (Otomatik Sıralı PC-01, PC-02, PC-03 Kaydı)
+    WinOps İstemci Kurulum Otomasyonu (v1.5.1)
+    Otomatik Sıralı PC-01, PC-02, PC-03 Kaydı & Otomatik Yönetici (Admin) Yetkisi / Fallback
 #>
 
 [CmdletBinding()]
@@ -15,38 +16,50 @@ param (
     [string]$GitHubRepo = "ayazOne/winops"
 )
 
-$ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Yönetici (Admin) kontrolü
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
 $InstallDir = "C:\WinOps\Client"
-if (-not (Test-Path $InstallDir)) {
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+try {
+    if (-not (Test-Path $InstallDir)) {
+        New-Item -ItemType Directory -Path $InstallDir -Force -ErrorAction Stop | Out-Null
+    }
+} catch {
+    $InstallDir = "$env:LOCALAPPDATA\WinOps\Client"
+    if (-not (Test-Path $InstallDir)) {
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    }
 }
 
-# Sunucudan otomatik sıralı ID (PC-01, PC-02, PC-03...) al
+# Sunucudan otomatik sıralı ID (PC-01, PC-02, PC-03...) al ([uri]::EscapeDataString ile %100 PS 5.1 uyumlu)
 $IdFilePath = "$InstallDir\client-id.txt"
 if ([string]::IsNullOrWhiteSpace($ClientId) -or $ClientId -eq "AUTO") {
-    try {
-        $assignResp = Invoke-RestMethod -Uri "$ServerUrl/api/assign-id?hostname=$([System.Web.HttpUtility]::UrlEncode($env:COMPUTERNAME))" -Method GET -TimeoutSec 8 -ErrorAction Stop
-        if ($assignResp.clientId) {
-            $ClientId = $assignResp.clientId
+    if (Test-Path $IdFilePath) {
+        $saved = (Get-Content $IdFilePath -Raw -ErrorAction SilentlyContinue).Trim()
+        if ($saved -and $saved -ne "AUTO") {
+            $ClientId = $saved
         }
-    } catch {
-        if (Test-Path $IdFilePath) {
-            $ClientId = (Get-Content $IdFilePath -Raw).Trim()
-        } else {
-            $ClientId = "AUTO"
+    }
+    if ([string]::IsNullOrWhiteSpace($ClientId) -or $ClientId -eq "AUTO") {
+        try {
+            $escapedHost = [uri]::EscapeDataString($env:COMPUTERNAME)
+            $assignResp = Invoke-RestMethod -Uri "$ServerUrl/api/assign-id?hostname=$escapedHost" -Method GET -TimeoutSec 8 -ErrorAction Stop
+            if ($assignResp.clientId) {
+                $ClientId = $assignResp.clientId
+            }
+        } catch {
+            $ClientId = $env:COMPUTERNAME
         }
     }
 }
-if ($ClientId -and $ClientId -ne "AUTO") {
-    Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force
-}
+Set-Content -Path $IdFilePath -Value $ClientId -Encoding UTF8 -Force -ErrorAction SilentlyContinue
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "  WinOps İstemci Dağıtımı ($ClientId)"      -ForegroundColor Cyan
 Write-Host "  Sunucu     : $ServerUrl"                 -ForegroundColor Yellow
-Write-Host "  GitHub Repo: $GitHubRepo"                -ForegroundColor Yellow
+Write-Host "  Yetki Modu : $(if ($isAdmin) { 'Yönetici (SYSTEM)' } else { 'Standart Kullanıcı' })" -ForegroundColor Yellow
 Write-Host "==========================================" -ForegroundColor Cyan
 
 # Eski çalışan istemci süreçlerini durdur
@@ -82,18 +95,29 @@ goto loop
 "@
 Set-Content -Path "$InstallDir\run.cmd" -Value $runCmd -Encoding ASCII
 
-# 3. Scheduled Task (Açılışta otomatik başlasın) ve Hemen Başlat
-$Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$InstallDir\run.cmd`""
-$Trigger = New-ScheduledTaskTrigger -AtStartup
-$Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+# 3. Kalıcılık (Admin ise SYSTEM Görevi, değilse Kullanıcı Başlangıç Kaydı — Access Denied hatası vermez!)
+if ($isAdmin) {
+    try {
+        $Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$InstallDir\run.cmd`""
+        $Trigger = New-ScheduledTaskTrigger -AtStartup
+        $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings | Out-Null
-Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -ErrorAction Stop | Out-Null
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Write-Host "[2/3] İstemci SYSTEM servisi olarak kaydedildi." -ForegroundColor Cyan
+    } catch {
+        Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "WinOpsClientAgent" -Value "`"$InstallDir\run.cmd`"" -Force -ErrorAction SilentlyContinue
+        Write-Host "[2/3] İstemci başlangıç kaydı (Registry) oluşturuldu." -ForegroundColor Cyan
+    }
+} else {
+    Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "WinOpsClientAgent" -Value "`"$InstallDir\run.cmd`"" -Force -ErrorAction SilentlyContinue
+    Write-Host "[2/3] Standart kullanıcı başlangıç kaydı oluşturuldu (Saat değiştirmek için CMD'yi Yönetici açmanız önerilir)." -ForegroundColor Yellow
+}
 
+# Arka planda hemen başlat
 Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$InstallDir\run.cmd`"" -WindowStyle Hidden
 
-Write-Host "[2/3] İstemci servisi kaydedildi ve başlatıldı." -ForegroundColor Cyan
 Write-Host "[3/3] Kurulum tamamlandı! Atanan İstemci Adı: $ClientId" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan
