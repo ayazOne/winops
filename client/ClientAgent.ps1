@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    WinOps Client Maintenance Agent with Autonomous GitHub OTA Self-Update
-    Kurumsal Windows istemcileri için güvenli bakım, senkronizasyon ve otonom güncelleme ajanı.
+    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.2.0)
+    Kurumsal Windows istemcileri için anlık saat izleme, müdahale, bakım ve otonom güncelleme ajanı.
 #>
 
 [CmdletBinding()]
@@ -13,13 +13,13 @@ param (
     [string]$ClientId = $env:COMPUTERNAME,
 
     [Parameter(Mandatory = $false)]
-    [int]$PollIntervalSeconds = 15,
+    [int]$PollIntervalSeconds = 3,
 
     [Parameter(Mandatory = $false)]
     [string]$GitHubRepo = "ayazOne/winops"
 )
 
-$AgentVersion = "1.1.0"
+$AgentVersion = "1.2.0"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 Write-Host "=============================================" -ForegroundColor Cyan
@@ -49,7 +49,7 @@ function Get-UptimeFormatted {
     }
 }
 
-# --- GitHub OTA Otonom Güncelleme (Zero-Click Self-Update) ---
+# --- GitHub OTA Otonom Güncelleme ---
 function Invoke-AgentSelfUpdate {
     try {
         $versionUrl = "https://raw.githubusercontent.com/$GitHubRepo/main/version.json?t=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
@@ -62,22 +62,19 @@ function Invoke-AgentSelfUpdate {
             $tempFile = "$env:TEMP\ClientAgent_new.ps1"
             Invoke-RestMethod -Uri $remoteScriptUrl -OutFile $tempFile -TimeoutSec 15 -ErrorAction Stop
 
-            # Sözdizimi geçerlilik testi
             $errors = $null
             [System.Management.Automation.PSParser]::Tokenize((Get-Content $tempFile -Raw), [ref]$errors) | Out-Null
             if ($errors.Count -gt 0) {
                 Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
-                return "Güncelleme iptal edildi: İndirilen betik sözdizimi hataları içeriyor."
+                return "Güncelleme iptal edildi: Sözdizimi hatası."
             }
 
-            # Mevcut dosyanın üzerine yaz
             $currentScriptPath = "C:\WinOps\Client\ClientAgent.ps1"
             Copy-Item -Path $tempFile -Destination $currentScriptPath -Force
             Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
 
             Write-Host "[OTA] Güncelleme tamamlandı (v$($remoteMeta.clientVersion)). Yeniden başlatılıyor..." -ForegroundColor Green
             
-            # Yeni süreci başlat ve mevcut süreci kapat
             Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$currentScriptPath`" -ServerUrl `"$ServerUrl`" -ClientId `"$ClientId`" -GitHubRepo `"$GitHubRepo`""
             Start-Sleep -Seconds 1
             Stop-Process -Id $PID -Force
@@ -90,7 +87,7 @@ function Invoke-AgentSelfUpdate {
     }
 }
 
-# --- Onaylı ve Güvenli Bakım Eylemleri ---
+# --- Onaylı Saat ve Bakım Eylemleri ---
 function Invoke-MaintenanceAction {
     param (
         [string]$Action,
@@ -104,24 +101,65 @@ function Invoke-MaintenanceAction {
         }
 
         "sync-ntp" {
-            Write-Host "[Bakım] NTP Saat Senkronizasyonu başlatılıyor..." -ForegroundColor Cyan
+            Write-Host "[Saat] NTP Saat Senkronizasyonu başlatılıyor..." -ForegroundColor Cyan
             try {
                 $svc = Get-Service -Name w32time -ErrorAction SilentlyContinue
                 if ($svc.Status -ne 'Running') {
-                    Start-Service -Name w32time -ErrorAction Stop
+                    Start-Service -Name w32time -ErrorAction SilentlyContinue
                 }
+                & w32tm /config /manualpeerlist:"time.windows.com,0x9 pool.ntp.org,0x9" /syncfromflags:manual /reliable:YES /update 2>&1 | Out-Null
                 $res = & w32tm /resync /force 2>&1 | Out-String
-                $output = "Saat Senkronizasyonu Başarılı:`n$res`nGüncel Sistem Saati: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+                $output = "NTP Senkronizasyonu Tamamlandı.`nYeni İstemci Saati: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))`nDetay: $($res.Trim())"
             } catch {
                 $output = "NTP Senkronizasyon Hatası: $($_.Exception.Message)"
             }
         }
 
+        "sync-server-time" {
+            Write-Host "[Saat] Sunucu saati ile doğrudan eşitleniyor..." -ForegroundColor Cyan
+            try {
+                $serverEpochMs = [int64]$Params["serverEpochMs"]
+                if ($serverEpochMs -gt 0) {
+                    $targetUtc = [DateTimeOffset]::FromUnixTimeMilliseconds($serverEpochMs).UtcDateTime
+                    $targetLocal = $targetUtc.ToLocalTime()
+                    Set-Date -Date $targetLocal -ErrorAction Stop | Out-Null
+                    $output = "İstemci saati sunucu saatine eşitlendi!`nYeni Saat: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+                } else {
+                    $output = "Hata: Geçersiz sunucu zaman damgası."
+                }
+            } catch {
+                $output = "Saat eşitleme hatası: $($_.Exception.Message)"
+            }
+        }
+
+        "set-custom-time" {
+            Write-Host "[Saat] Özel saat ayarlanıyor..." -ForegroundColor Cyan
+            try {
+                $timeStr = $Params["timeString"]
+                $offsetMinutes = $Params["offsetMinutes"]
+
+                if (-not [string]::IsNullOrWhiteSpace($timeStr)) {
+                    # Sadece HH:mm:ss veya tam tarih-saat
+                    $parsedDate = [DateTime]::Parse($timeStr)
+                    Set-Date -Date $parsedDate -ErrorAction Stop | Out-Null
+                    $output = "Saat manuel olarak ayarlandı: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+                } elseif ($null -ne $offsetMinutes) {
+                    $mins = [double]$offsetMinutes
+                    $newDate = (Get-Date).AddMinutes($mins)
+                    Set-Date -Date $newDate -ErrorAction Stop | Out-Null
+                    $output = "Saat ($mins dk) kaydırıldı. Yeni Saat: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+                } else {
+                    $output = "Hata: Saat parametresi eksik."
+                }
+            } catch {
+                $output = "Manuel saat ayarlama hatası: $($_.Exception.Message)"
+            }
+        }
+
         "clean-temp" {
-            Write-Host "[Bakım] Geçici dosya & önbellek temizliği yapılıyor..." -ForegroundColor Cyan
+            Write-Host "[Bakım] Geçici dosya temizliği yapılıyor..." -ForegroundColor Cyan
             $cleanedCount = 0
             $tempPaths = @($env:TEMP, "C:\Windows\Temp")
-            
             foreach ($path in $tempPaths) {
                 if (Test-Path $path) {
                     Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
@@ -132,7 +170,7 @@ function Invoke-MaintenanceAction {
                     }
                 }
             }
-            $output = "Önbellek temizliği tamamlandı. Temizlenen öğe sayısı: $cleanedCount"
+            $output = "Önbellek temizliği tamamlandı. Silinen öğe: $cleanedCount"
         }
 
         "restart-service" {
@@ -140,18 +178,16 @@ function Invoke-MaintenanceAction {
             if ([string]::IsNullOrWhiteSpace($serviceName) -or $serviceName -match '[^a-zA-Z0-9_\-]') {
                 $output = "Hata: Geçersiz servis adı formatı!"
             } else {
-                Write-Host "[Bakım] Servis yeniden başlatılıyor: $serviceName" -ForegroundColor Cyan
                 try {
                     Restart-Service -Name $serviceName -Force -ErrorAction Stop
-                    $output = "Servis '$serviceName' başarıyla yeniden başlatıldı. Durum: $((Get-Service -Name $serviceName).Status)"
+                    $output = "Servis '$serviceName' yeniden başlatıldı. Durum: $((Get-Service -Name $serviceName).Status)"
                 } catch {
-                    $output = "Servis başlatma başarısız: $($_.Exception.Message)"
+                    $output = "Servis başlatma hatası: $($_.Exception.Message)"
                 }
             }
         }
 
         "sys-info" {
-            Write-Host "[Bakım] Sistem bilgisi toplanıyor..." -ForegroundColor Cyan
             try {
                 $os = (Get-CimInstance Win32_OperatingSystem).Caption
                 $cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
@@ -162,6 +198,7 @@ function Invoke-MaintenanceAction {
 
                 $output = @"
 Ajan Sürümü     : v$AgentVersion
+Sistem Saati    : $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
 İşletim Sistemi : $os
 CPU Kullanımı   : %$cpu
 RAM Durumu      : Boş: $freeRamMB MB / Toplam: $totalRamMB MB
@@ -169,7 +206,7 @@ C: Disk Durumu  : Boş: $($disk.FreeGB) GB / Kullanılan: $($disk.UsedGB) GB
 Çalışma Süresi  : $(Get-UptimeFormatted)
 "@
             } catch {
-                $output = "Sistem bilgisi alınırken hata: $($_.Exception.Message)"
+                $output = "Sistem bilgisi hatası: $($_.Exception.Message)"
             }
         }
 
@@ -181,38 +218,46 @@ C: Disk Durumu  : Boş: $($disk.FreeGB) GB / Kullanılan: $($disk.UsedGB) GB
     return $output
 }
 
-# Her 45 saniyede bir doğrudan GitHub OTA sürüm kontrolü
 $lastUpdateCheck = [DateTime]::MinValue
+$cachedOsCaption = (Get-CimInstance Win32_OperatingSystem).Caption
+$cachedIp = Get-LocalIPv4
+$cachedTz = (Get-TimeZone).Id
 
-# --- Ana Döngü ---
+# --- Ana Döngü (3 Saniyede Bir Anlık Saat ve Görev Takibi) ---
 while ($true) {
     try {
-        # 1. Doğrudan GitHub üzerinden periyodik (45sn) otomatik güncelleme denetimi
         if ((Get-Date).Subtract($lastUpdateCheck).TotalSeconds -ge 45) {
             $lastUpdateCheck = Get-Date
+            $cachedIp = Get-LocalIPv4
             $null = Invoke-AgentSelfUpdate
         }
 
-        # 2. Heartbeat Gönderimi
+        $now = Get-Date
+        $epochMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+
+        # 1. Heartbeat + Anlık Saat Gönderimi
         $heartbeatData = @{
-            clientId = $ClientId
-            hostname = $env:COMPUTERNAME
-            ip       = Get-LocalIPv4
-            os       = (Get-CimInstance Win32_OperatingSystem).Caption
-            uptime   = Get-UptimeFormatted
-            version  = $AgentVersion
+            clientId   = $ClientId
+            hostname   = $env:COMPUTERNAME
+            ip         = $cachedIp
+            os         = $cachedOsCaption
+            uptime     = Get-UptimeFormatted
+            version    = $AgentVersion
+            systemTime = $now.ToString("HH:mm:ss")
+            systemDate = $now.ToString("yyyy-MM-dd")
+            epochMs    = $epochMs
+            timeZone   = $cachedTz
         } | ConvertTo-Json
 
-        $hbResp = Invoke-RestMethod -Uri "$ServerUrl/api/heartbeat" -Method POST -Body $heartbeatData -ContentType "application/json" -TimeoutSec 10 -ErrorAction Stop
+        $hbResp = Invoke-RestMethod -Uri "$ServerUrl/api/heartbeat" -Method POST -Body $heartbeatData -ContentType "application/json" -TimeoutSec 5 -ErrorAction Stop
 
-        # Eğer sunucu yeni bir istemci sürümü olduğunu bildirirse anında güncelle!
         if ($hbResp.expectedClientVersion -and ($hbResp.expectedClientVersion -ne $AgentVersion)) {
             $null = Invoke-AgentSelfUpdate
         }
 
-        # 3. Görev Sorgulama (Poll)
+        # 2. Görev Sorgulama (Poll)
         $pollUri = "$ServerUrl/api/tasks/poll?clientId=$([System.Web.HttpUtility]::UrlEncode($ClientId))"
-        $pollResp = Invoke-RestMethod -Uri $pollUri -Method GET -TimeoutSec 10 -ErrorAction Stop
+        $pollResp = Invoke-RestMethod -Uri $pollUri -Method GET -TimeoutSec 5 -ErrorAction Stop
 
         if ($pollResp.hasTask -and $pollResp.task) {
             $task = $pollResp.task
@@ -225,6 +270,22 @@ while ($true) {
 
             $taskResult = Invoke-MaintenanceAction -Action $task.action -Params $paramHt
 
+            # Görev sonrası güncel saati de hemen heartbeat ile bildir
+            $nowAfter = Get-Date
+            $postHb = @{
+                clientId   = $ClientId
+                hostname   = $env:COMPUTERNAME
+                ip         = $cachedIp
+                os         = $cachedOsCaption
+                uptime     = Get-UptimeFormatted
+                version    = $AgentVersion
+                systemTime = $nowAfter.ToString("HH:mm:ss")
+                systemDate = $nowAfter.ToString("yyyy-MM-dd")
+                epochMs    = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+                timeZone   = $cachedTz
+            } | ConvertTo-Json
+            $null = Invoke-RestMethod -Uri "$ServerUrl/api/heartbeat" -Method POST -Body $postHb -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
+
             $reportData = @{
                 taskId    = $task.id
                 clientId  = $ClientId
@@ -232,11 +293,11 @@ while ($true) {
                 output    = $taskResult
             } | ConvertTo-Json
 
-            $null = Invoke-RestMethod -Uri "$ServerUrl/api/tasks/result" -Method POST -Body $reportData -ContentType "application/json" -TimeoutSec 10 -ErrorAction SilentlyContinue
+            $null = Invoke-RestMethod -Uri "$ServerUrl/api/tasks/result" -Method POST -Body $reportData -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
         }
 
     } catch {
-        Write-Warning "[Bağlantı Hatası] Sunucuya ulaşılamadı ($ServerUrl): $($_.Exception.Message)"
+        Write-Warning "[Bağlantı Hatası] ($ServerUrl): $($_.Exception.Message)"
     }
 
     Start-Sleep -Seconds $PollIntervalSeconds

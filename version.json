@@ -1,7 +1,7 @@
 {
-  "version": "1.1.0",
-  "serverVersion": "1.1.0",
-  "clientVersion": "1.1.0",
+  "version": "1.2.0",
+  "serverVersion": "1.2.0",
+  "clientVersion": "1.2.0",
   "repo": "ayazOne/winops",
-  "releaseNotes": "Tam otonom (zero-click) kendi kendini güncelleme (45sn kontrol), self-healing loop ve NOC takip konsolu otomatik açılışı eklendi."
+  "releaseNotes": "Canlı İstemci Saat İzleme, Sapma (Drift) Analizi, Sunucu Saatine Anlık Eşitleme ve Manuel Saat Ayarlama (v1.2.0)."
 }
