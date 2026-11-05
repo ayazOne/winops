@@ -1,7 +1,7 @@
 {
-  "version": "1.7.0",
-  "serverVersion": "1.7.0",
-  "clientVersion": "1.7.0",
+  "version": "1.7.1",
+  "serverVersion": "1.7.1",
+  "clientVersion": "1.7.1",
   "repo": "ayazOne/winops",
-  "releaseNotes": "Numara Rezerve Etme (OFF Slot), Özel Numaralı CMD Üretici ve Sıradaki Sayacı Atlama/Ayarla Desteği (v1.7.0)."
+  "releaseNotes": "Hızlı İstemci Kurulum Komutu paneli eklendi, tek tıkla kopyalama butonu getirildi (v1.7.1)."
 }

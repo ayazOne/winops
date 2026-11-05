@@ -71,7 +71,7 @@ Write-Host "==========================================" -ForegroundColor Cyan
 # 1. En güncel Commit SHA ile GitHub CDN önbelleğini aşarak indir
 $commitSha = "main"
 try {
-    $refsResp = Invoke-WebRequest -Uri "https://github.com/$GitHubRepo/info/refs?service=git-upload-pack&t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())" -UseBasicParsing -TimeoutSec 8
+    $refsResp = Invoke-WebRequest -Uri "https://github.com/$GitHubRepo/info/refs?service=git-upload-pack&t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())" -Headers @{ "User-Agent" = "git/2.40.0" } -UseBasicParsing -TimeoutSec 8
     $refsText = if ($refsResp.Content -is [byte[]]) { [System.Text.Encoding]::ASCII.GetString($refsResp.Content) } else { [string]$refsResp.Content }
     if ($refsText -match '([0-9a-f]{40})\s+refs/heads/main') {
         $commitSha = $Matches[1]

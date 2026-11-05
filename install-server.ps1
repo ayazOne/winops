@@ -56,7 +56,7 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
 # 3. GitHub CDN önbelleğini aşmak için en son Commit SHA'yı al (0sn gecikme)
 $commitSha = "main"
 try {
-    $refsResp = Invoke-WebRequest -Uri "https://github.com/$GitHubRepo/info/refs?service=git-upload-pack&t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())" -UseBasicParsing -TimeoutSec 8
+    $refsResp = Invoke-WebRequest -Uri "https://github.com/$GitHubRepo/info/refs?service=git-upload-pack&t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())" -Headers @{ "User-Agent" = "git/2.40.0" } -UseBasicParsing -TimeoutSec 8
     $refsText = if ($refsResp.Content -is [byte[]]) { [System.Text.Encoding]::ASCII.GetString($refsResp.Content) } else { [string]$refsResp.Content }
     if ($refsText -match '([0-9a-f]{40})\s+refs/heads/main') {
         $commitSha = $Matches[1]

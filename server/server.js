@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const SERVER_VERSION = '1.7.0';
+const SERVER_VERSION = '1.7.1';
 const PORT = process.env.PORT || 3001;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'ayazOne/winops';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -89,7 +89,7 @@ const ALLOWED_ACTIONS = [
 
 let remoteVersionCache = {
   serverVersion: SERVER_VERSION,
-  clientVersion: '1.7.0',
+  clientVersion: '1.7.1',
   commitSha: 'main',
   lastChecked: '-'
 };
@@ -894,6 +894,9 @@ function getDashboardHtml() {
         </div>
       </div>
       <div class="nav-status">
+        <button class="btn btn-primary btn-sm" onclick="copyStandardClientCmd()" title="Yeni makine kurulum CMD komutunu panoya kopyalar">
+          📋 Kurulum Komutunu Kopyala
+        </button>
         <button class="btn btn-secondary btn-sm" onclick="openReserveModal()" title="İstediğiniz bir numarayı (örn: PC-12) rezerve edin veya CMD komutunu alın">
           ➕ Numara Rezerve Et / CMD Al
         </button>
@@ -908,6 +911,29 @@ function getDashboardHtml() {
   </nav>
 
   <main class="container">
+
+    <!-- Quick Client Setup Command Banner -->
+    <section class="sh-card" style="padding:14px 20px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; background:#0c0c10; border-color:#27272a;">
+      <div style="display:flex; align-items:center; gap:12px; flex:1; min-width:280px;">
+        <span style="font-size:22px;">⚡</span>
+        <div style="flex:1;">
+          <div style="font-size:13px; font-weight:600; color:var(--fg); margin-bottom:2px;">
+            Hızlı İstemci Kurulum Komutu (CMD)
+          </div>
+          <div style="font-size:11px; color:var(--muted-fg);">
+            Yeni bir bilgisayarı sisteme bağlamak için bu komutu CMD'ye yapıştırmanız yeterlidir:
+          </div>
+          <div style="margin-top:6px; background:#050507; border:1px solid #27272a; border-radius:6px; padding:8px 12px; font-family:'JetBrains Mono', monospace; font-size:11.5px; color:#38bdf8; overflow-x:auto; user-select:all; cursor:pointer;" onclick="copyStandardClientCmd()" title="Tıklayıp Kopyala" id="standardClientCmdBox">
+            powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/ayazOne/winops/main/install-client.ps1 | iex"
+          </div>
+        </div>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn btn-primary" onclick="copyStandardClientCmd()">
+          📋 Komutu Kopyala
+        </button>
+      </div>
+    </section>
 
     <section class="sh-card hero-banner">
       <div>
@@ -1221,6 +1247,11 @@ function getDashboardHtml() {
           document.getElementById('nextNumBadge').textContent = data.nextNumber;
         }
 
+        const stdCmdBox = document.getElementById('standardClientCmdBox');
+        if (stdCmdBox) {
+          stdCmdBox.textContent = \`powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/\${currentGithubRepo}/main/install-client.ps1 | iex"\`;
+        }
+
         if (data.remoteVersion && data.remoteVersion.lastChecked) {
           const shortSha = (data.remoteVersion.commitSha || '').slice(0, 7);
           document.getElementById('githubCheckInfo').textContent = 'Son Kontrol: ' + data.remoteVersion.lastChecked + ' (' + shortSha + ')';
@@ -1349,6 +1380,11 @@ function getDashboardHtml() {
     function copyClientCmd(id) {
       const cmd = getCmdForId(id);
       copyToClipboard(cmd, id + ' için kurulum CMD komutu kopyalandı!');
+    }
+
+    function copyStandardClientCmd() {
+      const cmd = \`powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/\${currentGithubRepo}/main/install-client.ps1 | iex"\`;
+      copyToClipboard(cmd, 'Yeni istemci kurulum komutu kopyalandı! Yeni makinede CMD ekranına yapıştırabilirsiniz.');
     }
 
     async function quickAction(clientId, action, params = {}, toastMsg = '') {
