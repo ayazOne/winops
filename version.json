@@ -1,7 +1,7 @@
 {
-  "version": "1.8.0",
-  "serverVersion": "1.8.0",
-  "clientVersion": "1.8.0",
+  "version": "1.8.1",
+  "serverVersion": "1.8.1",
+  "clientVersion": "1.8.1",
   "repo": "ayazOne/winops",
-  "releaseNotes": "%100 görünmez arka plan modu (Zero-Window VBS), tekil Mutex kilidi ve %0 CPU kullanımı (Zero-WMI Loop) optimizasyonu (v1.8.0)."
+  "releaseNotes": "Sunucu paneline Help (Komut & Sorun Giderme Rehberi) butonu ve senaryo bazlı komut kopyalama paneli eklendi (v1.8.1)."
 }

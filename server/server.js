@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const SERVER_VERSION = '1.8.0';
+const SERVER_VERSION = '1.8.1';
 const PORT = process.env.PORT || 3001;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'ayazOne/winops';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -89,7 +89,7 @@ const ALLOWED_ACTIONS = [
 
 let remoteVersionCache = {
   serverVersion: SERVER_VERSION,
-  clientVersion: '1.8.0',
+  clientVersion: '1.8.1',
   commitSha: 'main',
   lastChecked: '-'
 };
@@ -903,6 +903,9 @@ function getDashboardHtml() {
         <button class="btn btn-outline btn-sm" onclick="openCounterModal()" title="Sıradaki otomatik sayaç numarasını değiştirin">
           Sıradaki: <strong id="nextNumBadge" style="color:var(--emerald); margin-left:4px;">PC-01</strong> ✏️
         </button>
+        <button class="btn btn-secondary btn-sm" onclick="openHelpModal()" title="Hangi durumda hangi komut yazılır? Rehber & Komut Listesi">
+          ❓ Help / Komutlar
+        </button>
         <button class="btn btn-danger btn-sm" onclick="resetAllClients()">
           🗑️ Listeyi Sıfırla
         </button>
@@ -931,6 +934,9 @@ function getDashboardHtml() {
       <div style="display:flex; gap:8px;">
         <button class="btn btn-primary" onclick="copyStandardClientCmd()">
           📋 Komutu Kopyala
+        </button>
+        <button class="btn btn-secondary" onclick="openHelpModal()" title="Hangi durumda ne yazılmalı?">
+          ❓ Komut Rehberi
         </button>
       </div>
     </section>
@@ -1163,6 +1169,113 @@ function getDashboardHtml() {
     </div>
   </div>
 
+  <!-- Modal: Help / Command & Troubleshooting Guide -->
+  <div class="modal-overlay" id="helpModal" onclick="if(event.target===this)closeHelpModal()">
+    <div class="modal-dialog" style="max-width:740px; max-height:88vh; display:flex; flex-direction:column;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+        <h3 style="font-size:16px; font-weight:600; display:flex; align-items:center; gap:8px;">
+          <span>📖</span> WinOps Komut &amp; Sorun Giderme Rehberi (Help)
+        </h3>
+        <button class="btn btn-outline btn-sm" onclick="closeHelpModal()" style="padding:4px 10px; font-size:12px;">✕ Kapat</button>
+      </div>
+      <p style="font-size:12px; color:var(--muted-fg); margin-bottom:14px;">
+        Hangi senaryoda hangi komutun yazılması gerektiği aşağıda listelenmiştir. İlgili komutu <strong>Kopyala</strong> butonuna basıp istemci makinede CMD veya PowerShell ekranına yapıştırmanız yeterlidir.
+      </p>
+
+      <div style="overflow-y:auto; padding-right:6px; display:flex; flex-direction:column; gap:12px; flex:1;">
+
+        <!-- 1. Standart Otomatik Kurulum -->
+        <div style="background:#09090b; border:1px solid #27272a; border-radius:8px; padding:12px 14px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; gap:8px; flex-wrap:wrap;">
+            <div style="font-size:13px; font-weight:600; color:#38bdf8; display:flex; align-items:center; gap:6px;">
+              <span>🚀</span> 1. Standart İstemci Kurulumu (Sıradaki PC Numarasını Otomatik Alır)
+            </div>
+            <button class="btn btn-primary btn-sm" onclick="copyHelpCmd('helpCmd_std')">📋 Kopyala</button>
+          </div>
+          <div style="font-size:11.5px; color:#a1a1aa; margin-bottom:8px; line-height:1.5;">
+            <span style="color:#f4f4f5; font-weight:600;">Hangi Durumda Yazılır:</span> Yeni bir bilgisayarı sisteme bağlamak istediğinizde. Sunucudan sıradaki boş sıra numarasını (PC-01, PC-02...) otomatik çeker, %100 gizli arka plan modunda başlatır.
+          </div>
+          <div style="background:#000; border:1px solid #18181b; border-radius:6px; padding:8px 10px; font-family:'JetBrains Mono', monospace; font-size:11px; color:#38bdf8; overflow-x:auto; user-select:all; cursor:pointer;" onclick="copyHelpCmd('helpCmd_std')" title="Tıklayıp Kopyala" id="helpCmd_std">powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/ayazOne/winops/main/install-client.ps1 | iex"</div>
+        </div>
+
+        <!-- 2. Belirli Bir Numara ile Kurulum -->
+        <div style="background:#09090b; border:1px solid #27272a; border-radius:8px; padding:12px 14px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; gap:8px; flex-wrap:wrap;">
+            <div style="font-size:13px; font-weight:600; color:#a78bfa; display:flex; align-items:center; gap:6px;">
+              <span>🎯</span> 2. Belirli Bir Numara ile Kurulum (Örn: PC-12)
+            </div>
+            <button class="btn btn-secondary btn-sm" onclick="copyHelpCmd('helpCmd_custom')">📋 Kopyala</button>
+          </div>
+          <div style="font-size:11.5px; color:#a1a1aa; margin-bottom:8px; line-height:1.5;">
+            <span style="color:#f4f4f5; font-weight:600;">Hangi Durumda Yazılır:</span> Sıradaki otomatik numara yerine doğrudan istediğiniz bir sıra numarasını (örneğin rezerve ettiğiniz PC-12) atamak istediğinizde. (Komuttaki 'PC-12' kısmını dilediğiniz gibi düzenleyebilirsiniz).
+          </div>
+          <div style="background:#000; border:1px solid #18181b; border-radius:6px; padding:8px 10px; font-family:'JetBrains Mono', monospace; font-size:11px; color:#a78bfa; overflow-x:auto; user-select:all; cursor:pointer;" onclick="copyHelpCmd('helpCmd_custom')" title="Tıklayıp Kopyala" id="helpCmd_custom">powershell -ExecutionPolicy Bypass -NoProfile -Command "&amp; ([scriptblock]::Create((irm https://raw.githubusercontent.com/ayazOne/winops/main/install-client.ps1))) -ClientId 'PC-12'"</div>
+        </div>
+
+        <!-- 3. Acil Kurtarma & Pencereleri Kapatma -->
+        <div style="background:#09090b; border:1px solid #27272a; border-radius:8px; padding:12px 14px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; gap:8px; flex-wrap:wrap;">
+            <div style="font-size:13px; font-weight:600; color:#34d399; display:flex; align-items:center; gap:6px;">
+              <span>⚡</span> 3. Acil Kurtarma / Mavi Pencereleri Kapatma &amp; Sessiz Moda Alma
+            </div>
+            <button class="btn btn-secondary btn-sm" onclick="copyHelpCmd('helpCmd_recover')">📋 Kopyala</button>
+          </div>
+          <div style="font-size:11.5px; color:#a1a1aa; margin-bottom:8px; line-height:1.5;">
+            <span style="color:#f4f4f5; font-weight:600;">Hangi Durumda Yazılır:</span> İstemci makinede eski sürümlerden kalan mavi PowerShell pencereleri açılıp kapanıyorsa, döngüye girmişse veya CPU %100 olmuşsa. Bu komut tek hamlede tüm eski pencereleri kapatıp v1.8.0 sessiz arka plan moduna alır.
+          </div>
+          <div style="background:#000; border:1px solid #18181b; border-radius:6px; padding:8px 10px; font-family:'JetBrains Mono', monospace; font-size:11px; color:#34d399; overflow-x:auto; user-select:all; cursor:pointer;" onclick="copyHelpCmd('helpCmd_recover')" title="Tıklayıp Kopyala" id="helpCmd_recover">powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/ayazOne/winops/main/install-client.ps1 | iex"</div>
+        </div>
+
+        <!-- 4. İstemciyi Tamamen Durdurma & Kaldırma -->
+        <div style="background:#09090b; border:1px solid #27272a; border-radius:8px; padding:12px 14px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; gap:8px; flex-wrap:wrap;">
+            <div style="font-size:13px; font-weight:600; color:#fb7185; display:flex; align-items:center; gap:6px;">
+              <span>🛑</span> 4. İstemciyi Tamamen Durdurma &amp; Kaldırma (Uninstall)
+            </div>
+            <button class="btn btn-danger btn-sm" onclick="copyHelpCmd('helpCmd_uninstall')">📋 Kopyala</button>
+          </div>
+          <div style="font-size:11.5px; color:#a1a1aa; margin-bottom:8px; line-height:1.5;">
+            <span style="color:#f4f4f5; font-weight:600;">Hangi Durumda Yazılır:</span> Bir bilgisayardan WinOps istemcisini tamamen silmek, çalışan tüm arka plan ajanlarını kapatmak, başlangıç kayıtlarını ve geçici dosyalarını tamamen temizlemek istediğinizde.
+          </div>
+          <div style="background:#000; border:1px solid #18181b; border-radius:6px; padding:8px 10px; font-family:'JetBrains Mono', monospace; font-size:11px; color:#fb7185; overflow-x:auto; user-select:all; cursor:pointer;" onclick="copyHelpCmd('helpCmd_uninstall')" title="Tıklayıp Kopyala" id="helpCmd_uninstall">powershell -ExecutionPolicy Bypass -NoProfile -Command "Stop-Process -Name powershell,cmd,wscript -ErrorAction SilentlyContinue; Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'WinOpsClientAgent' -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName 'WinOpsClientAgent' -Confirm:$false -ErrorAction SilentlyContinue; Remove-Item -Path 'C:\WinOps\Client', '$env:LOCALAPPDATA\WinOps\Client' -Recurse -Force -ErrorAction SilentlyContinue; Write-Host 'WinOps istemcisi tamamen kaldirildi.' -ForegroundColor Green"</div>
+        </div>
+
+        <!-- 5. Ajan Çalışma Durumu Kontrolü -->
+        <div style="background:#09090b; border:1px solid #27272a; border-radius:8px; padding:12px 14px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; gap:8px; flex-wrap:wrap;">
+            <div style="font-size:13px; font-weight:600; color:#fbbf24; display:flex; align-items:center; gap:6px;">
+              <span>🔍</span> 5. Ajan Çalışma Durumu Kontrolü (Process ID)
+            </div>
+            <button class="btn btn-outline btn-sm" onclick="copyHelpCmd('helpCmd_status')">📋 Kopyala</button>
+          </div>
+          <div style="font-size:11.5px; color:#a1a1aa; margin-bottom:8px; line-height:1.5;">
+            <span style="color:#f4f4f5; font-weight:600;">Hangi Durumda Yazılır:</span> İstemci makinede ajanın arka planda sessizce çalışıp çalışmadığını ve Process ID'sini istemci CMD ekranında doğrulamak istediğinizde.
+          </div>
+          <div style="background:#000; border:1px solid #18181b; border-radius:6px; padding:8px 10px; font-family:'JetBrains Mono', monospace; font-size:11px; color:#fbbf24; overflow-x:auto; user-select:all; cursor:pointer;" onclick="copyHelpCmd('helpCmd_status')" title="Tıklayıp Kopyala" id="helpCmd_status">powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'ClientAgent' } | Select-Object ProcessId, CommandLine"</div>
+        </div>
+
+        <!-- 6. Sunucu Kurulumu / Yeniden Başlatma -->
+        <div style="background:#09090b; border:1px solid #27272a; border-radius:8px; padding:12px 14px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; gap:8px; flex-wrap:wrap;">
+            <div style="font-size:13px; font-weight:600; color:#38bdf8; display:flex; align-items:center; gap:6px;">
+              <span>🖥️</span> 6. WinOps Sunucu Kurulumu / Yeniden Başlatma (Server Host)
+            </div>
+            <button class="btn btn-secondary btn-sm" onclick="copyHelpCmd('helpCmd_server')">📋 Kopyala</button>
+          </div>
+          <div style="font-size:11.5px; color:#a1a1aa; margin-bottom:8px; line-height:1.5;">
+            <span style="color:#f4f4f5; font-weight:600;">Hangi Durumda Yazılır:</span> Ana sunucu makinesinde WinOps Node.js yönetim konsolunu sıfırdan kurmak veya en güncel sürümle yeniden başlatmak istediğinizde.
+          </div>
+          <div style="background:#000; border:1px solid #18181b; border-radius:6px; padding:8px 10px; font-family:'JetBrains Mono', monospace; font-size:11px; color:#38bdf8; overflow-x:auto; user-select:all; cursor:pointer;" onclick="copyHelpCmd('helpCmd_server')" title="Tıklayıp Kopyala" id="helpCmd_server">powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/ayazOne/winops/main/install-server.ps1 | iex"</div>
+        </div>
+
+      </div>
+
+      <div style="margin-top:14px; display:flex; justify-content:flex-end;">
+        <button class="btn btn-outline" style="min-width:100px;" onclick="closeHelpModal()">Kapat</button>
+      </div>
+    </div>
+  </div>
+
   <div class="toast-wrap" id="toastWrap"></div>
 
   <script>
@@ -1251,6 +1364,15 @@ function getDashboardHtml() {
         if (stdCmdBox) {
           stdCmdBox.textContent = \`powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/\${currentGithubRepo}/main/install-client.ps1 | iex"\`;
         }
+
+        const helpStd = document.getElementById('helpCmd_std');
+        if (helpStd) helpStd.textContent = \`powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/\${currentGithubRepo}/main/install-client.ps1 | iex"\`;
+        const helpCust = document.getElementById('helpCmd_custom');
+        if (helpCust) helpCust.textContent = \`powershell -ExecutionPolicy Bypass -NoProfile -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/\${currentGithubRepo}/main/install-client.ps1))) -ClientId 'PC-12'"\`;
+        const helpRec = document.getElementById('helpCmd_recover');
+        if (helpRec) helpRec.textContent = \`powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/\${currentGithubRepo}/main/install-client.ps1 | iex"\`;
+        const helpSrv = document.getElementById('helpCmd_server');
+        if (helpSrv) helpSrv.textContent = \`powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/\${currentGithubRepo}/main/install-server.ps1 | iex"\`;
 
         if (data.remoteVersion && data.remoteVersion.lastChecked) {
           const shortSha = (data.remoteVersion.commitSha || '').slice(0, 7);
@@ -1563,6 +1685,32 @@ function getDashboardHtml() {
       await quickAction(modalTargetClient, 'set-custom-time', { offsetMinutes }, 'Saat kaydırıldı (' + sign + offsetMinutes + ' dk)');
       closeTimeModal();
     }
+
+    // Help Modal Functions
+    function openHelpModal() {
+      document.getElementById('helpModal').style.display = 'flex';
+    }
+
+    function closeHelpModal() {
+      document.getElementById('helpModal').style.display = 'none';
+    }
+
+    function copyHelpCmd(elementId) {
+      const el = document.getElementById(elementId);
+      if (!el) return;
+      const text = el.textContent.trim();
+      copyToClipboard(text, 'Komut panoya kopyalandı! Yeni makinede veya CMD ekranında çalıştırabilirsiniz.');
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        closeTimeModal();
+        closeRenameModal();
+        closeReserveModal();
+        closeCounterModal();
+        closeHelpModal();
+      }
+    });
 
     loadDashboard();
     setInterval(loadDashboard, 2000);
