@@ -1,7 +1,7 @@
 {
-  "version": "1.7.1",
-  "serverVersion": "1.7.1",
-  "clientVersion": "1.7.1",
+  "version": "1.8.0",
+  "serverVersion": "1.8.0",
+  "clientVersion": "1.8.0",
   "repo": "ayazOne/winops",
-  "releaseNotes": "Hızlı İstemci Kurulum Komutu paneli eklendi, tek tıkla kopyalama butonu getirildi (v1.7.1)."
+  "releaseNotes": "%100 görünmez arka plan modu (Zero-Window VBS), tekil Mutex kilidi ve %0 CPU kullanımı (Zero-WMI Loop) optimizasyonu (v1.8.0)."
 }

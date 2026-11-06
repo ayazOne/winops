@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.6.0)
-    Sunucu Sıralı Kayıt (PC-01, PC-02, PC-03) & Token Doğrulamalı Ajan
+    WinOps Client Maintenance & Real-Time Clock Sync Agent (v1.8.0)
+    %100 Arka Plan (Zero-Window VBS), Düşük CPU (Zero-WMI Loop) & Sıralı Kayıt Ajanı
 #>
 
 [CmdletBinding()]
@@ -16,16 +16,80 @@ param (
     [string]$Token = "",
 
     [Parameter(Mandatory = $false)]
-    [int]$PollIntervalSeconds = 3,
+    [int]$PollIntervalSeconds = 4,
 
     [Parameter(Mandatory = $false)]
-    [string]$GitHubRepo = "ayazOne/winops"
+    [string]$GitHubRepo = "ayazOne/winops",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SilentMode
 )
 
-$AgentVersion = "1.7.0"
+$AgentVersion = "1.8.0"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif (Test-Path "C:\WinOps\Client") { "C:\WinOps\Client" } else { "$env:LOCALAPPDATA\WinOps\Client" }
 $AuthFilePath = "$BaseDir\client-auth.json"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# 1. Eski run.cmd döngüsünü etkisiz hale getir (sürekli pencere açmasını anında durdur)
+$legacyRunCmd = "$BaseDir\run.cmd"
+if (Test-Path $legacyRunCmd) {
+    try {
+        Set-Content -Path $legacyRunCmd -Value "@echo off`r`nexit /b 0" -Encoding ASCII -Force -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+# 2. Tamamen görünmez (0 pencere) VBS başlatıcısını oluştur
+$vbsPath = "$BaseDir\silent-runner.vbs"
+$vbsContent = @"
+Set fso = CreateObject("Scripting.FileSystemObject")
+baseDir = fso.GetParentFolderName(WScript.ScriptFullName)
+scriptPath = baseDir & "\ClientAgent.ps1"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & scriptPath & """ -ServerUrl ""$ServerUrl"" -GitHubRepo ""$GitHubRepo"" -SilentMode", 0, False
+"@
+try {
+    Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII -Force -ErrorAction SilentlyContinue
+} catch {}
+
+# 3. Asılı kalmış tüm eski cmd.exe (run.cmd) ve diğer powershell.exe (ClientAgent.ps1) süreçlerini temizle
+try {
+    Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe' OR Name = 'powershell.exe'" -ErrorAction SilentlyContinue | Where-Object {
+        $_.ProcessId -ne $PID -and (
+            $_.CommandLine -match 'ClientAgent\.ps1' -or
+            $_.CommandLine -match 'WinOps\\Client\\run\.cmd'
+        )
+    } | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+} catch {}
+
+# 4. Eğer görünür pencereli modda başlatıldıysa, görünmez VBS moduna geç ve bu pencereyi anında kapat
+if (-not $SilentMode) {
+    try {
+        Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "WinOpsClientAgent" -Value "wscript.exe //B //NoLogo `"$vbsPath`"" -Force -ErrorAction SilentlyContinue
+    } catch {}
+    Start-Process -FilePath "wscript.exe" -ArgumentList "//B //NoLogo `"$vbsPath`"" -WindowStyle Hidden
+    Stop-Process -Id $PID -Force
+    exit 0
+}
+
+# 5. İşlemci (CPU) önceliğini BelowNormal yap (sistemi ve oyunları/uygulamaları asla yormasın)
+try {
+    [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+} catch {}
+
+# 6. Tekil Çalışma Kilidi (Mutex) - Aynı anda birden fazla ajan çalışmasını kesin olarak engeller
+$script:SingleInstanceMutex = New-Object System.Threading.Mutex($false, "Local\WinOpsClientAgentMutex_v18")
+$hasHandle = $false
+try {
+    $hasHandle = $script:SingleInstanceMutex.WaitOne(0, $false)
+} catch [System.Threading.AbandonedMutexException] {
+    $hasHandle = $true
+}
+if (-not $hasHandle) {
+    Stop-Process -Id $PID -Force
+    exit 0
+}
 
 if (Test-Path $AuthFilePath) {
     try {
@@ -35,26 +99,39 @@ if (Test-Path $AuthFilePath) {
     } catch {}
 }
 
-# Eğer token yoksa (eski kurulumdan kalan ajan ise) çık, listeyi kirletme
+# Eğer token yoksa çık
 if ([string]::IsNullOrWhiteSpace($Token)) {
+    try {
+        $script:SingleInstanceMutex.ReleaseMutex()
+        $script:SingleInstanceMutex.Dispose()
+    } catch {}
     Stop-Process -Id $PID -Force
     exit 0
 }
 
 function Get-LocalIPv4 {
     try {
-        $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|vEthernet' -and $_.IPAddress -notmatch '^169\.254\.' } | Select-Object -First 1).IPAddress
-        if (-not $ip) { $ip = "127.0.0.1" }
-        return $ip
-    } catch {
-        return "127.0.0.1"
-    }
+        $addrs = [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) | Where-Object {
+            $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
+            $_.IPAddressToString -ne '127.0.0.1' -and
+            $_.IPAddressToString -notmatch '^169\.254\.'
+        }
+        if ($addrs) {
+            return $addrs[0].IPAddressToString
+        }
+    } catch {}
+    return "127.0.0.1"
 }
+
+$script:BootTime = try { (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { (Get-Date).AddHours(-1) }
+$cachedOsCaption = try { (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).Caption } catch { "Windows" }
+$cachedIp = Get-LocalIPv4
+$cachedTz = try { (Get-TimeZone).Id } catch { "Local" }
+$script:LastUpdateAttempt = [DateTime]::MinValue
 
 function Get-UptimeFormatted {
     try {
-        $bootTime = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime
-        $uptime = (Get-Date) - $bootTime
+        $uptime = (Get-Date) - $script:BootTime
         return "{0}g {1}s {2}dk" -f $uptime.Days, $uptime.Hours, $uptime.Minutes
     } catch {
         return "Bilinmiyor"
@@ -64,7 +141,7 @@ function Get-UptimeFormatted {
 function Get-LatestGitHubCommitSha {
     try {
         $uri = "https://github.com/$GitHubRepo/info/refs?service=git-upload-pack&t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
-        $resp = Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+        $resp = Invoke-WebRequest -Uri $uri -Headers @{ "User-Agent" = "git/2.40.0" } -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
         $text = if ($resp.Content -is [byte[]]) { [System.Text.Encoding]::ASCII.GetString($resp.Content) } else { [string]$resp.Content }
         if ($text -match '([0-9a-f]{40})\s+refs/heads/main') {
             return $Matches[1]
@@ -75,9 +152,15 @@ function Get-LatestGitHubCommitSha {
 
 function Invoke-AgentSelfUpdate {
     param (
-        [string]$CommitSha = ""
+        [string]$CommitSha = "",
+        [switch]$ForceCheck
     )
     try {
+        if (-not $ForceCheck -and ((Get-Date).Subtract($script:LastUpdateAttempt).TotalSeconds -lt 45)) {
+            return "OTA bekleme süresinde."
+        }
+        $script:LastUpdateAttempt = Get-Date
+
         $ref = if ([string]::IsNullOrWhiteSpace($CommitSha)) { Get-LatestGitHubCommitSha } else { $CommitSha }
         $versionUrl = "https://raw.githubusercontent.com/$GitHubRepo/$ref/version.json?t=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
         $remoteMeta = Invoke-RestMethod -Uri $versionUrl -TimeoutSec 8 -ErrorAction Stop
@@ -87,8 +170,18 @@ function Invoke-AgentSelfUpdate {
             $tempFile = "$env:TEMP\ClientAgent_new.ps1"
             Invoke-RestMethod -Uri $remoteScriptUrl -OutFile $tempFile -TimeoutSec 12 -ErrorAction Stop
 
+            $rawNewScript = Get-Content $tempFile -Raw -ErrorAction Stop
+
+            # Sonsuz güncelleme döngüsü koruması: İndirilen dosyadaki sürüm mevcut sürümle aynıysa yeniden başlatma!
+            if ($rawNewScript -match '\$AgentVersion\s*=\s*"([^"]+)"') {
+                if ($Matches[1] -eq $AgentVersion) {
+                    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+                    return "İndirilen dosya sürümü ($($Matches[1])) zaten çalışıyor."
+                }
+            }
+
             $errors = $null
-            [System.Management.Automation.PSParser]::Tokenize((Get-Content $tempFile -Raw), [ref]$errors) | Out-Null
+            [System.Management.Automation.PSParser]::Tokenize($rawNewScript, [ref]$errors) | Out-Null
             if ($errors.Count -gt 0) {
                 Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
                 return "Güncelleme iptal edildi: Sözdizimi hatası."
@@ -98,10 +191,16 @@ function Invoke-AgentSelfUpdate {
             Copy-Item -Path $tempFile -Destination $currentScriptPath -Force
             Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
 
-            Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$currentScriptPath`" -ServerUrl `"$ServerUrl`" -ClientId `"$ClientId`" -Token `"$Token`" -GitHubRepo `"$GitHubRepo`""
-            Start-Sleep -Seconds 1
+            try {
+                if ($script:SingleInstanceMutex) {
+                    $script:SingleInstanceMutex.ReleaseMutex()
+                    $script:SingleInstanceMutex.Dispose()
+                }
+            } catch {}
+
+            Start-Process -FilePath "wscript.exe" -ArgumentList "//B //NoLogo `"$vbsPath`"" -WindowStyle Hidden
             Stop-Process -Id $PID -Force
-            return "İstemci v$($remoteMeta.clientVersion) sürümüne güncellendi."
+            exit 0
         } else {
             return "İstemci güncel (v$AgentVersion)."
         }
@@ -119,7 +218,7 @@ function Invoke-MaintenanceAction {
     $output = ""
     switch ($Action) {
         "update-agent" {
-            $output = Invoke-AgentSelfUpdate
+            $output = Invoke-AgentSelfUpdate -ForceCheck
         }
 
         "sync-ntp" {
@@ -242,7 +341,6 @@ function Invoke-MaintenanceAction {
 
         "sys-info" {
             try {
-                $os = (Get-CimInstance Win32_OperatingSystem).Caption
                 $cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
                 $osInfo = Get-CimInstance Win32_OperatingSystem
                 $freeRamMB = [math]::Round($osInfo.FreePhysicalMemory / 1024, 2)
@@ -253,7 +351,7 @@ function Invoke-MaintenanceAction {
 İstemci Adı     : $ClientId
 Ajan Sürümü     : v$AgentVersion
 Sistem Saati    : $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
-İşletim Sistemi : $os
+İşletim Sistemi : $cachedOsCaption
 CPU Kullanımı   : %$cpu
 RAM Durumu      : Boş: $freeRamMB MB / Toplam: $totalRamMB MB
 C: Disk Durumu  : Boş: $($disk.FreeGB) GB / Kullanılan: $($disk.UsedGB) GB
@@ -272,20 +370,18 @@ C: Disk Durumu  : Boş: $($disk.FreeGB) GB / Kullanılan: $($disk.UsedGB) GB
     return $output
 }
 
-$lastUpdateCheck = [DateTime]::MinValue
-$cachedOsCaption = (Get-CimInstance Win32_OperatingSystem).Caption
-$cachedIp = Get-LocalIPv4
-$cachedTz = (Get-TimeZone).Id
+$lastIpRefresh = Get-Date
 
 while ($true) {
     try {
-        if ((Get-Date).Subtract($lastUpdateCheck).TotalSeconds -ge 10) {
-            $lastUpdateCheck = Get-Date
+        $now = Get-Date
+
+        # IP adresini yalnızca 5 dakikada bir hafif .NET DNS ile yenile (WMI kullanmaz)
+        if ($now.Subtract($lastIpRefresh).TotalSeconds -ge 300) {
+            $lastIpRefresh = $now
             $cachedIp = Get-LocalIPv4
-            $null = Invoke-AgentSelfUpdate
         }
 
-        $now = Get-Date
         $epochMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
 
         $heartbeatData = @{
@@ -307,6 +403,10 @@ while ($true) {
         # Eğer sunucu listesi sıfırlandıysa veya bu cihaz listeden silindiyse çalışmayı durdur!
         if ($hbResp.unregistered) {
             Remove-Item $AuthFilePath -Force -ErrorAction SilentlyContinue
+            try {
+                $script:SingleInstanceMutex.ReleaseMutex()
+                $script:SingleInstanceMutex.Dispose()
+            } catch {}
             Stop-Process -Id $PID -Force
             exit 0
         }
@@ -318,6 +418,7 @@ while ($true) {
             Set-Content -Path $AuthFilePath -Value $newAuth -Encoding UTF8 -Force -ErrorAction SilentlyContinue
         }
 
+        # Yalnızca sunucu yeni bir sürüm bildirdiğinde OTA güncellemesini tetikle (gereksiz GitHub sorgularını önler)
         if ($hbResp.expectedClientVersion -and ($hbResp.expectedClientVersion -ne $AgentVersion)) {
             $null = Invoke-AgentSelfUpdate -CommitSha $hbResp.commitSha
         }
@@ -361,7 +462,12 @@ while ($true) {
             $null = Invoke-RestMethod -Uri "$ServerUrl/api/tasks/result" -Method POST -Body $reportData -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
         }
 
-    } catch {}
+    } catch {
+        # Sunucuya ulaşılamıyorsa 60 saniyede bir doğrudan GitHub üzerinden kurtarma güncellemesi kontrol et
+        if ((Get-Date).Subtract($script:LastUpdateAttempt).TotalSeconds -ge 60) {
+            $null = Invoke-AgentSelfUpdate
+        }
+    }
 
     Start-Sleep -Seconds $PollIntervalSeconds
 }
